@@ -1,8 +1,0 @@
-package com.hugodehu.gitmiro.domain.models
-
-import androidx.compose.runtime.Immutable
-
-@Immutable
-data class Identity(val name: String?, val email: String?)
-
-fun emptyIdentity() = Identity(name = null, email = null)

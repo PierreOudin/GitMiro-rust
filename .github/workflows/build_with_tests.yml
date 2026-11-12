@@ -1,35 +1,92 @@
-# Workflow to run with every commit added to the main branch.
-# Windows, Mac-os and LibSSH are not built to avoid wasting CI minutes, as it takes quite some time.
+# Checks the Tauri app on pull requests to main only, to save GitHub Actions minutes:
+# no run on branch pushes, on merges to main, on draft PRs or on docs-only changes.
+# Marking a draft ready for review starts the run; a newer push cancels the running one.
+# Windows is the product target: it runs every check and builds the MSI/NSIS installers.
+# Linux and macOS (development platform) only build their packages.
 
 name: Test Build
 
 on:
-  push:
-    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".impeccable/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  build_tauri_windows:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          lfs: true
       - uses: dtolnay/rust-toolchain@stable
-      - name: Set up JDK 25
-        uses: actions/setup-java@v5
         with:
-          java-version: '25'
-          distribution: 'jetbrains'
-          architecture: x64
-      - name: Build with Gradle
-        uses: gradle/gradle-build-action@67421db6bd0bf253fb4bd25b31ebb98943c375e1
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v6
         with:
-          arguments: build
-      - name: Tests
-        uses: gradle/gradle-build-action@67421db6bd0bf253fb4bd25b31ebb98943c375e1
+          node-version: 22
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Test frontend
+        run: npm test
+      - name: Check Rust formatting
+        working-directory: src-tauri
+        run: cargo fmt --check
+      - name: Lint Rust backend
+        working-directory: src-tauri
+        run: cargo clippy -- -D warnings
+      - name: Test Rust backend
+        working-directory: src-tauri
+        run: cargo test
+      - name: Build frontend and Windows installers
+        run: npm run tauri build
+
+  build_tauri_unix:
+    if: ${{ !github.event.pull_request.draft }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
         with:
-          arguments: test
+          lfs: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2 \
+            xdg-utils
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build desktop packages
+        run: npm run tauri build

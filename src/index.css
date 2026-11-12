@@ -1,0 +1,72 @@
+@font-face {
+  font-family: Geist;
+  src: url("../assets/fonts/Geist-Regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: Geist;
+  src: url("../assets/fonts/Geist-SemiBold.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+
+:root {
+  font-family: Geist, "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: #e7e8ec;
+  background: #0e0f13;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --ink: #e7e8ec;
+  --ink-muted: #9a9dab;
+  --surface-window: #0e0f13;
+  --surface: #14151a;
+  --surface-hover: #1c1e25;
+  --border: #292b33;
+  --accent: #8b7cff;
+  --accent-hover: #a095ff;
+  --on-accent: #0e0f13;
+  --accent-soft: #1d1a33;
+  --error: #f87171;
+  --success: #66bb6a;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color: #15161a;
+    background: #ffffff;
+
+    --ink: #15161a;
+    --ink-muted: #5b5f6e;
+    --surface-window: #ffffff;
+    --surface: #eceef2;
+    --surface-hover: #e2e4eb;
+    --border: #d7d9e1;
+    --accent: #6e5be8;
+    --accent-hover: #5a47d6;
+    --on-accent: #ffffff;
+    --accent-soft: #edebfc;
+    --error: #d9363e;
+    --success: #2e7d32;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 800px;
+  min-height: 100%;
+  margin: 0;
+}

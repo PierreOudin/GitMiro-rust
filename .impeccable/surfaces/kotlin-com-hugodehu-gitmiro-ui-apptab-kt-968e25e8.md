@@ -1,7 +1,7 @@
 ---
 version: 1
 slug: "kotlin-com-hugodehu-gitmiro-ui-apptab-kt-968e25e8"
-primary_target: "app/src/main/kotlin/com/hugodehu/gitmiro/ui/AppTab.kt"
+primary_target: "src/App.tsx"
 related_targets: ["app/src/main/kotlin/com/hugodehu/gitmiro/theme/Color.kt","app/src/main/kotlin/com/hugodehu/gitmiro/App.kt"]
 ---
 

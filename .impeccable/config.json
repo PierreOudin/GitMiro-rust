@@ -110,6 +110,18 @@
         ],
         "createdAt": "2026-11-03T08:17:08.472Z",
         "reason": "Claude: throwaway decision sketch; full-bleed log rows, branch pills and the intentional floating peek card trip these rules"
+      },
+      {
+        "rule": "overused-font",
+        "value": "geist mono",
+        "createdAt": "2026-11-04T22:22:23.930Z",
+        "reason": "GitMiro Kotlin baseline loads Geist Mono from Typography.kt; port mission requires preserving its typography."
+      },
+      {
+        "rule": "overused-font",
+        "value": "geist",
+        "createdAt": "2026-11-04T22:22:24.680Z",
+        "reason": "GitMiro Kotlin baseline loads Geist from Typography.kt; port mission requires preserving its typography."
       }
     ]
   }

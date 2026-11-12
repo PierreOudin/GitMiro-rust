@@ -1,4 +1,0 @@
-[toolchain]
-# Pinned instead of "nightly": a new nightly every day means a new compiler, which makes cargo rebuild everything
-# (OpenSSL included, ~40 minutes on CI) and defeats the release workflow's rs/target cache. Bump the date on purpose.
-channel = "nightly-2026-10-22"
