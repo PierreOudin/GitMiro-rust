@@ -1,6 +1,6 @@
 @font-face {
   font-family: Geist;
-  src: url("../../app/src/main/composeResources/font/Geist-Regular.ttf") format("truetype");
+  src: url("../assets/fonts/Geist-Regular.ttf") format("truetype");
   font-style: normal;
   font-weight: 400;
   font-display: swap;
@@ -8,7 +8,7 @@
 
 @font-face {
   font-family: Geist;
-  src: url("../../app/src/main/composeResources/font/Geist-SemiBold.ttf") format("truetype");
+  src: url("../assets/fonts/Geist-SemiBold.ttf") format("truetype");
   font-style: normal;
   font-weight: 600;
   font-display: swap;

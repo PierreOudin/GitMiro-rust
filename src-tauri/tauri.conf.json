@@ -32,12 +32,12 @@
   "bundle": {
     "active": true,
     "license": "GPL-3.0-only",
-    "licenseFile": "../../LICENSE",
+    "licenseFile": "../LICENSE",
     "targets": "all",
     "icon": [
-      "../../icons/logo.png",
-      "../../icons/icon.icns",
-      "../../icons/icon.ico"
+      "../assets/icons/logo.png",
+      "../assets/icons/icon.icns",
+      "../assets/icons/icon.ico"
     ]
   }
 }
