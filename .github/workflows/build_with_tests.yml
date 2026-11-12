@@ -1,19 +1,15 @@
-# Checks the Tauri app on pull requests to main and on pushes to main.
+# Checks the Tauri app on pull requests to main only, to save GitHub Actions minutes:
+# no run on branch pushes, on merges to main, on draft PRs or on docs-only changes.
+# Marking a draft ready for review starts the run; a newer push cancels the running one.
 # Windows is the product target: it runs every check and builds the MSI/NSIS installers.
 # Linux and macOS (development platform) only build their packages.
-# Docs-only changes don't run anything; a newer push cancels the running check.
 
 name: Test Build
 
 on:
-  push:
-    branches: [ "main" ]
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
-      - ".impeccable/**"
   pull_request:
     branches: [ "main" ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
@@ -28,6 +24,7 @@ permissions:
 
 jobs:
   build_tauri_windows:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: windows-latest
 
     steps:
@@ -57,6 +54,7 @@ jobs:
         run: npm run tauri build
 
   build_tauri_unix:
+    if: ${{ !github.event.pull_request.draft }}
     strategy:
       matrix:
         os: [ubuntu-22.04, macos-latest]
