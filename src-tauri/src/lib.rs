@@ -34,10 +34,12 @@ fn git_command() -> Command {
     // .git/config and hooks Git will honor. Hardened here and in the callers: core.fsmonitor (runs on status),
     // log.showSignature (runs gpg.program on log), diff.external and textconv (--no-ext-diff, --no-textconv),
     // prompts and inherited stdin, hangs (timeouts).
-    // NOT hardened, as with the Git CLI itself, because Git offers no switch: hooks and gpg programs on commit,
-    // and filter.<name>.clean/smudge commands, which can run on status (stat-dirty files), add, diff and checkout.
-    // Opening a repository from an untrusted source is therefore running its configuration. A "trust this
-    // repository" prompt before the first status is the follow-up if that matters.
+    // NOT hardened, as with the Git CLI itself: hooks (pre-commit and friends on commit, and post-index-change,
+    // which runs whenever Git writes the index: status refreshing stat-dirty entries, add, rm, reset, checkout),
+    // gpg programs on commit, and filter.<name>.clean/smudge commands (status, add, diff, checkout).
+    // Opening a repository from an untrusted source therefore runs its configuration, even before any click.
+    // Possible follow-ups: -c core.hooksPath=<nowhere> on every call but commit, and a "trust this repository"
+    // prompt before the first status.
     command.args([
         "-c",
         "core.fsmonitor=false",
@@ -3161,8 +3163,11 @@ exit 1
     #[test]
     fn a_timeout_stops_processes_started_by_git() {
         // cmd.exe stands in for a hook shell: a plain Child::kill leaves its ping.exe child running.
+        // A payload size derived from the test process id makes the command line unique, so a concurrent run
+        // (another worktree, another agent) is never mistaken for a survivor.
+        let size = 1000 + std::process::id() % 60000;
         let mut child = std::process::Command::new("cmd")
-            .args(["/c", "ping -n 47 -l 13 127.0.0.2"])
+            .args(["/c", &format!("ping -n 47 -l {size} 127.0.0.2")])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3179,9 +3184,11 @@ exit 1
         )
         .unwrap_err();
 
-        let query = "(Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object { $_.CommandLine -like '*-l 13 127.0.0.2*' }).ProcessId";
+        let query = format!(
+            "(Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object {{ $_.CommandLine -like '*-l {size} 127.0.0.2*' }}).ProcessId"
+        );
         let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", query])
+            .args(["-NoProfile", "-Command", &query])
             .output()
             .unwrap();
         let survivors = String::from_utf8_lossy(&output.stdout).trim().to_owned();
