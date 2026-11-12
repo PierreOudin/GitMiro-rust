@@ -2,6 +2,8 @@
 
 Task GM-66 (parent US4.1 / GM-35). Run date: 2026-11-12. Raw results (JSONL, goldens, traces) stay outside Git; the protocol and scripts are in [`docs/perf/gm66/`](gm66/).
 
+> Moved to `PierreOudin/GitMiro-rust` by GM-68 (2026-11-12). The results below are unchanged. Paths and SHAs refer to `Isipharm/GitMiro`, where the port lived under `rust/`: `rust/src-tauri/src/lib.rs` is now `src-tauri/src/lib.rs`. The Kotlin app measured here is built from `Isipharm/GitMiro`. The scripts take every path as a parameter and need no change.
+
 ## 1. Executive summary
 
 - Same machine, same 1,000-commit fixture, same driver, both apps in release form. The two apps were run interleaved (Kotlin, Tauri, Kotlin, ...), 5 runs each for the startup/memory/CPU campaign (owner decision: 5 is enough, the original brief asked for at least 10), 10 runs for the Tauri frontend scenarios and for Git CLI alone.

@@ -6,7 +6,7 @@
 
 web
 
-(Closest schema value. GitMiro is a Compose Multiplatform Desktop app, used mainly on Windows; design work is prototyped in HTML and then ported to Compose tokens in `app/src/main/kotlin/com/hugodehu/gitmiro/theme`.)
+(Closest schema value. GitMiro is a Tauri v2 desktop app with a React/TypeScript UI rendered in the system WebView, used mainly on Windows; design tokens are CSS custom properties in `src/index.css`. The original Kotlin/Compose app in `Isipharm/GitMiro` is the visual reference.)
 
 ## Users
 
@@ -18,7 +18,7 @@ A desktop Git client that makes the repository's state legible at a glance and l
 
 ## Positioning
 
-A fork of Gitnuro (FOSS, JGit, no web technologies) that adds in-app conflict resolution (keep a side, or pick blocks with checkboxes, preview and edit the result), "show in file explorer" with selection, and its own settings so it runs next to the official Gitnuro.
+A rewrite of GitMiro, itself a fork of Gitnuro (FOSS), on Tauri, React and the Git CLI. GitMiro adds in-app conflict resolution (keep a side, or pick blocks with checkboxes, preview and edit the result), "show in file explorer" with selection, and its own settings so it runs next to the official Gitnuro.
 
 ## Operating Context
 
@@ -28,8 +28,8 @@ A fork of Gitnuro (FOSS, JGit, no web technologies) that adds in-app conflict re
 
 ## Capabilities and Constraints
 
-- UI is Compose Desktop (Material 1 `Colors` + custom `ColorsScheme`); themes are JSON-serializable and user-customizable, so any new visual system must map to a flat set of named color tokens.
-- Bundled fonts: Geist (UI) and Geist Mono (code), OFL, stored in Git LFS. Changing faces means shipping new font files.
+- UI is React in a Tauri WebView, styled with plain CSS and custom properties. The Kotlin app themes (Material 1 `Colors` + custom `ColorsScheme`, JSON-serializable and user-customizable) are the reference, so any visual system must map to a flat set of named color tokens.
+- Bundled fonts: Geist (UI), OFL, stored in Git LFS in `assets/fonts`; the Kotlin reference also uses Geist Mono for code. Changing faces means shipping new font files.
 - Light and dark themes are equal citizens; a "Dark Blue" legacy theme also exists.
 - Log graph lanes use a repeating list of `graphColors`.
 
