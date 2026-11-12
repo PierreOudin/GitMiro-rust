@@ -16,9 +16,9 @@ or amends staged changes. It is not released yet.
 | [PierreOudin/GitMiro-rust](https://github.com/PierreOudin/GitMiro-rust) (this one) | Active Tauri/React/Rust application. All rewrite work lands on `main`. |
 | [Isipharm/GitMiro](https://github.com/Isipharm/GitMiro) | Original Kotlin/Compose/JGit application, released and still evolving. Functional and visual reference for the rewrite; read-only from this project. |
 
-The Rust port started on `feat/GM-35-tauri-react-foundation` in Isipharm/GitMiro and was moved here by GM-68 (source
-`b80dad30`, last Rust code `f1793e27`). The history before that move, including the Kotlin application, is kept in this
-repository's Git history.
+The Rust port started in Isipharm/GitMiro and was moved here by GM-68 (source commits in
+[ADR-001](docs/adr-001-tauri-react.md#repository-split-gm-68)). The Kotlin application remains in this repository's Git
+history.
 
 ## Development
 

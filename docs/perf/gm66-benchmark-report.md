@@ -2,7 +2,7 @@
 
 Task GM-66 (parent US4.1 / GM-35). Run date: 2026-11-12. Raw results (JSONL, goldens, traces) stay outside Git; the protocol and scripts are in [`docs/perf/gm66/`](gm66/).
 
-> Moved to `PierreOudin/GitMiro-rust` by GM-68 (2026-11-12). The results below are unchanged. Paths and SHAs refer to `Isipharm/GitMiro`, where the port lived under `rust/`: `rust/src-tauri/src/lib.rs` is now `src-tauri/src/lib.rs`. The Kotlin app measured here is built from `Isipharm/GitMiro`. The scripts take every path as a parameter and need no change.
+> Moved to `PierreOudin/GitMiro-rust` by GM-68 (2026-11-12). The results below are unchanged. Paths and SHAs refer to `Isipharm/GitMiro`, where the port lived under `rust/`: `rust/src-tauri/src/lib.rs` is now `src-tauri/src/lib.rs`. The scripts take every path as a parameter and need no change.
 
 ## 1. Executive summary
 

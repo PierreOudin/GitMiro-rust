@@ -18,13 +18,13 @@ Git operation through the Git CLI; there is no Kotlin, Gradle or JGit code here.
 - Notion is the source of truth for Epics, Features, User Stories, tasks, dependencies, acceptance criteria and Quality
   Gates. Record commits, SHAs, test results and reviews on the Notion task; only record what was actually done.
 - Commits follow Conventional Commits and cite the Notion task ID (e.g. `Refs: GM-68`).
-- Evidence from GM-61 to GM-66 (ADR-001 snapshots, `docs/perf/`) refers to the former `rust/` folder of
-  `Isipharm/GitMiro`; keep it as historical evidence and do not rewrite its results.
+- Do not rewrite the GM-61 to GM-66 evidence (ADR-001 snapshots, `docs/perf/`); its paths and SHAs are those of
+  `Isipharm/GitMiro`.
 
 ## Layout
 
 ```
-src/              React/TypeScript UI (App.tsx, App.css, index.css)
+src/              React/TypeScript UI
 src-tauri/        Rust backend (src/lib.rs: Tauri commands and Git CLI calls), tauri.conf.json, capabilities/
 tests/            frontend tests (node:test, run with --experimental-strip-types)
 assets/fonts/     Geist Regular and SemiBold (Git LFS) + OFL.txt
@@ -35,9 +35,7 @@ docs/             ADR-001, GM-66 benchmark report and scripts (docs/perf/gm66/)
 
 ## Build and checks
 
-Requirements: Node 22.6 or later (for `--experimental-strip-types`), the Rust stable toolchain, Git on PATH, and the Tauri v2 platform prerequisites (WebView2 on
-Windows, Xcode command line tools on macOS, webkit2gtk 4.1 on Linux). Fonts are in Git LFS, so clone with Git LFS
-installed.
+Requirements: see [DEVELOPMENT.md](DEVELOPMENT.md#requirements).
 
 ```bash
 npm ci
@@ -66,12 +64,13 @@ it (protocol in `docs/perf/gm66-benchmark-report.md`).
 - Keep Tauri capabilities (`src-tauri/capabilities/default.json`) and the CSP in `tauri.conf.json` minimal.
 - Windows is the reference product platform. macOS is a supported development platform; do not claim a Windows
   validation from macOS.
-- The installed identifier `com.isipharm.gitmiro` and the product name are unchanged on purpose; changing them moves
-  the WebView data (recent repositories) and the install identity. See ADR-001.
-- Never commit generated files: `dist/`, `node_modules/`, `src-tauri/target/`, `src-tauri/gen/schemas`, installers.
+- Do not change the identifier `com.isipharm.gitmiro` or the product name: it is pending an owner decision, and a
+  change moves the WebView data (recent repositories) and the install identity. See ADR-001.
 
 ## CI
 
-`.github/workflows/build_with_tests.yml` runs on pull requests to `main` and pushes to `main`, except docs-only
-changes. The Windows job runs the frontend tests, `cargo fmt`, `clippy`, `cargo test` and builds the MSI/NSIS
-installers; Linux and macOS jobs build their packages. There is no release workflow yet: do not publish releases.
+`.github/workflows/build_with_tests.yml` runs only on non-draft pull requests to `main` (not on branch pushes,
+merges or docs-only changes), to save GitHub Actions minutes: open the PR as a draft while work is in progress. The
+Windows job runs the frontend tests, `cargo fmt`, `clippy`, `cargo test` and builds the MSI/NSIS installers. Linux and
+macOS jobs build their packages; they do not run the tests, so run
+`npm test` and `cargo clippy`/`cargo test` locally on macOS. There is no release workflow yet: do not publish releases.

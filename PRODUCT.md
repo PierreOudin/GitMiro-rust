@@ -18,9 +18,11 @@ A desktop Git client that makes the repository's state legible at a glance and l
 
 ## Positioning
 
-A rewrite of GitMiro, itself a fork of Gitnuro (FOSS), on Tauri, React and the Git CLI. GitMiro adds in-app conflict resolution (keep a side, or pick blocks with checkboxes, preview and edit the result), "show in file explorer" with selection, and its own settings so it runs next to the official Gitnuro.
+A rewrite of GitMiro, itself a fork of Gitnuro (FOSS), on Tauri, React and the Git CLI. The Kotlin GitMiro, which the rewrite targets, adds in-app conflict resolution (keep a side, or pick blocks with checkboxes, preview and edit the result), "show in file explorer" with selection, and its own settings so it runs next to the official Gitnuro.
 
 ## Operating Context
+
+Target experience, as in the Kotlin reference; the rewrite covers only part of it so far.
 
 - Desktop window, multiple repository tabs, side panel (branches, remotes, tags, stashes, submodules), log graph, file status and diff panes in split layouts.
 - Dense, keyboard-and-mouse work; dialogs and context menus for most Git operations.

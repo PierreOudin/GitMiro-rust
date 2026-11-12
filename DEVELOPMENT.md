@@ -15,23 +15,15 @@ and package are listed in [AGENTS.md](AGENTS.md#build-and-checks).
   - macOS (Intel or Apple Silicon): Xcode command line tools.
   - Linux: webkit2gtk 4.1 and the packages listed in `.github/workflows/build_with_tests.yml`.
 
-Perl, a JDK and Gradle were needed by the Kotlin app only and are no longer required.
+In a clone that was used for the Kotlin app, run `git clean -fdX` on the old `main` before switching, or delete the
+leftover `app/`, `domain/`, `data/`, `rs/` and `build/` folders: they are no longer ignored.
 
-## Platforms
+## Windows checks
 
-Windows is the reference product platform: installers (MSI and NSIS) are built and validated there. macOS, including
-Apple Silicon, is a supported development platform: run the frontend tests, `cargo fmt`/`clippy`/`test` and
-`npm run tauri dev` there, but Windows-specific behavior (WebView2, `CREATE_NO_WINDOW` on Git spawns, installers) can
-only be validated on Windows.
-
+Windows-specific behavior (WebView2, `CREATE_NO_WINDOW` on Git spawns, installers) can only be validated on Windows.
 Before calling a change that touches startup, packaging or Git spawning done, check on Windows:
 
 1. `npm run tauri build` produces `src-tauri/target/release/bundle/msi/*.msi` and `bundle/nsis/*-setup.exe`.
 2. The built app starts, opens a temporary Git repository, shows history and status, and stages, unstages and commits
    a file without console windows appearing.
 3. Fonts (Geist) and the window/installer icons are displayed.
-
-## IDE
-
-Any editor works. VS Code with the rust-analyzer and Tauri extensions, or RustRover/WebStorm, are common choices.
-Open the repository root: `package.json` is there, and `src-tauri/Cargo.toml` is the Rust crate.
