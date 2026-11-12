@@ -64,7 +64,7 @@ it (protocol in `docs/perf/gm66-benchmark-report.md`).
 - Keep Tauri capabilities (`src-tauri/capabilities/default.json`) and the CSP in `tauri.conf.json` minimal.
 - Windows is the reference product platform. macOS is a supported development platform; do not claim a Windows
   validation from macOS.
-- Do not change the identifier `com.isipharm.gitmiro` or the product name: it is pending an owner decision, and a
+- Do not change the identifier `com.isipharm.gitmiro` or the product name: the owner decided to keep them, and a
   change moves the WebView data (recent repositories) and the install identity. See ADR-001.
 
 ## CI
