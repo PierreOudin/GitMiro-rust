@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "GitMiro",
+  "version": "0.1.0",
+  "identifier": "com.isipharm.gitmiro",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "GitMiro",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self' asset: http://asset.localhost",
+        "connect-src": "ipc: http://ipc.localhost",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "font-src": "'self' asset: http://asset.localhost",
+        "style-src": "'self'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "license": "GPL-3.0-only",
+    "licenseFile": "../../LICENSE",
+    "targets": "all",
+    "icon": [
+      "../../icons/logo.png",
+      "../../icons/icon.icns",
+      "../../icons/icon.ico"
+    ]
+  }
+}
