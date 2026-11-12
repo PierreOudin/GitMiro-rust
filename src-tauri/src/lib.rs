@@ -7,21 +7,29 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_GIT_STDOUT_BYTES: usize = 512 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 16 * 1024;
 const COMMIT_PAGE_SIZE: usize = 500;
 const MAX_GRAPH_LANES: usize = 4096;
+/// Reference listings grow with the repository (about 100 bytes per ref), so they get a larger cap than diffs.
+const MAX_HISTORY_REFS_BYTES: usize = 16 * 1024 * 1024;
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Commits may run slow hooks or wait for a signing prompt.
+const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Git command that never creates a console window (the release build uses the GUI subsystem, so each spawn would otherwise allocate a console host).
 fn git_command() -> Command {
     let mut command = Command::new("git");
+    // A repository can set core.fsmonitor to a command that Git then runs on every status; never honor it.
+    command.args(["-c", "core.fsmonitor=false"]);
+    command.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000); // CREATE_NO_WINDOW
     command
@@ -101,6 +109,8 @@ struct RepositoryStatus {
     staged: Vec<StatusEntry>,
     unstaged: Vec<StatusEntry>,
     truncated: bool,
+    /// A merge is waiting for its commit; it can be committed with an empty index.
+    merging: bool,
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq)]
@@ -213,22 +223,52 @@ fn collect_output(mut child: Child) -> Result<Output, String> {
 }
 
 fn collect_output_with_input(child: &mut Child, input: Option<&[u8]>) -> Result<Output, String> {
-    collect_output_inner(child, input, false, false).map(|(output, _)| output)
+    collect_output_inner(
+        child,
+        input,
+        false,
+        false,
+        MAX_GIT_STDOUT_BYTES,
+        GIT_TIMEOUT,
+    )
+    .map(|(output, _)| output)
 }
 
 fn collect_output_with_truncated_stdout(child: Child) -> Result<(Output, bool), String> {
     let mut child = child;
-    collect_output_inner(&mut child, None, true, false)
+    collect_output_inner(
+        &mut child,
+        None,
+        true,
+        false,
+        MAX_GIT_STDOUT_BYTES,
+        GIT_TIMEOUT,
+    )
 }
 
 fn collect_output_killing_on_truncation(child: Child) -> Result<Output, String> {
     let mut child = child;
-    collect_output_inner(&mut child, None, false, true).map(|(output, _)| output)
+    collect_output_inner(
+        &mut child,
+        None,
+        false,
+        true,
+        MAX_GIT_STDOUT_BYTES,
+        GIT_TIMEOUT,
+    )
+    .map(|(output, _)| output)
 }
 
 fn collect_output_capped_and_killing_on_truncation(child: Child) -> Result<(Output, bool), String> {
     let mut child = child;
-    collect_output_inner(&mut child, None, true, true)
+    collect_output_inner(
+        &mut child,
+        None,
+        true,
+        true,
+        MAX_GIT_STDOUT_BYTES,
+        GIT_TIMEOUT,
+    )
 }
 
 fn collect_output_inner(
@@ -236,14 +276,15 @@ fn collect_output_inner(
     input: Option<&[u8]>,
     allow_truncated_stdout: bool,
     kill_on_truncated_stdout: bool,
+    stdout_limit: usize,
+    timeout: Duration,
 ) -> Result<(Output, bool), String> {
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout_overflow = Arc::new(AtomicBool::new(false));
     let stdout_reader_overflow = kill_on_truncated_stdout.then(|| Arc::clone(&stdout_overflow));
-    let stdout_reader = thread::spawn(move || {
-        read_capped_signaling(stdout, MAX_GIT_STDOUT_BYTES, stdout_reader_overflow)
-    });
+    let stdout_reader =
+        thread::spawn(move || read_capped_signaling(stdout, stdout_limit, stdout_reader_overflow));
     let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_GIT_STDERR_BYTES));
     if let Some(input) = input {
         let result = child.stdin.take().expect("piped stdin").write_all(input);
@@ -255,26 +296,28 @@ fn collect_output_inner(
             return Err(format!("Could not write Git input: {error}"));
         }
     }
-    let status = if kill_on_truncated_stdout {
-        loop {
-            if stdout_overflow.load(Ordering::Relaxed) {
-                let _ = child.kill();
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(format!("Could not wait for Git: {error}"));
-                }
-            }
+    // Poll instead of blocking in wait() so a hung Git (credential or signing prompt, stuck hook) can be killed.
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_micros(250);
+    let status = loop {
+        if stdout_overflow.load(Ordering::Relaxed) {
+            let _ = child.kill();
         }
-    } else {
-        match child.wait() {
-            Ok(status) => status,
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The readers are left to finish on their own: a hook that outlived Git may still hold the pipes.
+                return Err(format!(
+                    "Git did not finish within {} seconds and was stopped",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => {
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(2));
+            }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -294,7 +337,10 @@ fn collect_output_inner(
         .map_err(|error| format!("Could not read Git error output: {error}"))?;
 
     if stdout_truncated && !allow_truncated_stdout {
-        return Err("Git output exceeded the 512 KiB limit".to_owned());
+        return Err(format!(
+            "Git output exceeded the {} KiB limit",
+            stdout_limit / 1024
+        ));
     }
     if stderr_truncated {
         stderr.extend_from_slice(b"\n[Git error output truncated]");
@@ -393,6 +439,31 @@ fn git_text(path: &Path, args: &[&str]) -> Result<String, String> {
             .trim_end_matches(['\r', '\n'])
             .to_owned()
     })
+}
+
+fn git_text_with_stdout_limit(
+    path: &Path,
+    args: &[&str],
+    stdout_limit: usize,
+) -> Result<String, String> {
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let (output, _) =
+        collect_output_inner(&mut child, None, false, false, stdout_limit, GIT_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned())
 }
 
 fn git_text_with_input(path: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
@@ -601,7 +672,18 @@ fn repository_status(path: &Path) -> Result<RepositoryStatus, String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
-    parse_status(&output.stdout, truncated)
+    let mut status = parse_status(&output.stdout, truncated)?;
+    status.merging = merge_in_progress(path)?;
+    Ok(status)
+}
+
+fn merge_in_progress(path: &Path) -> Result<bool, String> {
+    // Plain repositories keep MERGE_HEAD in `.git`; skip a Git spawn on the hot status path.
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        return Ok(dot_git.join("MERGE_HEAD").exists());
+    }
+    Ok(git_path(path, "MERGE_HEAD")?.exists())
 }
 
 fn git_path_os_string(path_bytes: &[u8]) -> Result<OsString, String> {
@@ -686,6 +768,10 @@ fn conflict_stages(path: &Path, path_bytes: &[u8]) -> Result<BTreeMap<u8, Confli
     Ok(stages)
 }
 
+fn has_conflict_stages(stages: &BTreeMap<u8, ConflictStage>) -> bool {
+    stages.keys().any(|stage| *stage > 0)
+}
+
 fn resolve_conflict_side(
     path: &Path,
     path_bytes: &[u8],
@@ -704,12 +790,13 @@ fn resolve_conflict_side(
     }
 
     let stages = conflict_stages(path, path_bytes)?;
-    let (stage, other_stage) = match side {
-        ConflictSide::Current => (2, 3),
-        ConflictSide::Incoming => (3, 2),
+    let stage = match side {
+        ConflictSide::Current => 2,
+        ConflictSide::Incoming => 3,
     };
     let side_exists = stages.contains_key(&stage);
-    if !side_exists && !stages.contains_key(&other_stage) {
+    // A both-deleted (DD) conflict only has the base stage; resolving it removes the path.
+    if !has_conflict_stages(&stages) {
         return Err("The selected file is no longer in conflict".to_owned());
     }
     let expected = stages.get(&stage).map(|entry| ConflictStage {
@@ -784,7 +871,7 @@ fn conflict_versions(
     path_bytes: &[u8],
 ) -> Result<(ConflictVersion, ConflictVersion), String> {
     let stages = conflict_stages(path, path_bytes)?;
-    if !stages.contains_key(&2) && !stages.contains_key(&3) {
+    if !has_conflict_stages(&stages) {
         return Err("The selected file is no longer in conflict".to_owned());
     }
 
@@ -1101,7 +1188,8 @@ fn git_path(path: &Path, name: &str) -> Result<PathBuf, String> {
 }
 
 fn config_value(path: &Path, scope: &str, key: &str) -> Option<String> {
-    let output = git_output(path, &["config", scope, "--get", key], None).ok()?;
+    // --includes: a scope flag turns include.path off by default, but identities are often kept in included files.
+    let output = git_output(path, &["config", scope, "--includes", "--get", key], None).ok()?;
     output.status.success().then(|| {
         String::from_utf8_lossy(&output.stdout)
             .trim_end()
@@ -1117,32 +1205,41 @@ fn read_identity(path: &Path, scope: &str) -> CommitIdentity {
 }
 
 fn commit_message_metadata(path: &Path) -> Result<CommitMetadata, String> {
-    let merge_head = git_path(path, "MERGE_HEAD")?;
-    let merging = merge_head.exists();
+    let merging = merge_in_progress(path)?;
     let message_path = if merging {
         git_path(path, "MERGE_MSG")?
     } else {
         git_path(path, "COMMIT_EDITMSG")?
     };
-    let draft = match fs::read_to_string(message_path) {
-        Ok(message) => message,
+    // Lossy: a message written by another tool in a legacy encoding must not block opening the repository.
+    let draft = match fs::read(message_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(format!("Could not read commit message: {error}")),
     };
-    let draft = if merging {
-        draft
+    let without_comments = |message: &str| {
+        message
             .lines()
             .filter(|line| !line.starts_with('#'))
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
             .to_owned()
-    } else {
-        draft
     };
     let previous_message = history_head(path)?
         .map(|_| git_text(path, &["log", "-1", "--format=%B"]))
         .transpose()?;
+    let draft = if merging {
+        without_comments(&draft)
+    } else if previous_message.as_deref().is_some_and(|previous| {
+        // Git rewrites COMMIT_EDITMSG on every commit, including the ones made in a terminal;
+        // a draft equal to the last commit message is that leftover, not unsent work.
+        draft.trim() == previous.trim() || without_comments(&draft) == previous.trim()
+    }) {
+        String::new()
+    } else {
+        draft
+    };
     Ok(CommitMetadata {
         draft,
         previous_message,
@@ -1152,8 +1249,7 @@ fn commit_message_metadata(path: &Path) -> Result<CommitMetadata, String> {
 }
 
 fn write_commit_message(path: &Path, message: &str) -> Result<(), String> {
-    let merge_head = git_path(path, "MERGE_HEAD")?;
-    let message_path = if merge_head.exists() {
+    let message_path = if merge_in_progress(path)? {
         git_path(path, "MERGE_MSG")?
     } else {
         git_path(path, "COMMIT_EDITMSG")?
@@ -1231,6 +1327,10 @@ fn commit_sign_off(
     let signature = format
         .replace("%user", identity.name.as_deref().unwrap_or_default())
         .replace("%email", identity.email.as_deref().unwrap_or_default());
+    // An amend starts from the previous message, which already carries the sign-off.
+    if message.lines().any(|line| line.trim() == signature.trim()) {
+        return Ok(message.to_owned());
+    }
     Ok(format!("{message}\n\n{signature}"))
 }
 
@@ -1269,7 +1369,8 @@ fn commit_changes(
         return Err("Commit message cannot be empty".to_owned());
     }
     let status = repository_status(path)?;
-    if !amend && status.staged.is_empty() {
+    // A merge whose result equals HEAD leaves nothing staged but still has to be concluded.
+    if !amend && status.staged.is_empty() && !status.merging {
         return Err("Stage changes before committing".to_owned());
     }
     if amend && history_head(path)?.is_none() {
@@ -1308,7 +1409,7 @@ fn commit_changes(
     }
 
     let message = commit_sign_off(path, message, &resolved_identity)?;
-    let merging = git_path(path, "MERGE_HEAD")?.exists();
+    let merging = status.merging;
     let mut command = git_command();
     command
         .arg("-C")
@@ -1344,7 +1445,14 @@ fn commit_changes(
     let mut child = command
         .spawn()
         .map_err(|error| format!("Could not start Git commit: {error}"))?;
-    let output = collect_output_with_input(&mut child, Some(message.as_bytes()))?;
+    let (output, _) = collect_output_inner(
+        &mut child,
+        Some(message.as_bytes()),
+        false,
+        false,
+        MAX_GIT_STDOUT_BYTES,
+        GIT_COMMIT_TIMEOUT,
+    )?;
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -1383,7 +1491,7 @@ fn history_head(path: &Path) -> Result<Option<String>, String> {
 }
 
 fn history_refs(path: &Path, head: Option<&str>) -> Result<HistoryRefs, String> {
-    let refs = git_text(
+    let refs = git_text_with_stdout_limit(
         path,
         &[
             "for-each-ref",
@@ -1392,6 +1500,7 @@ fn history_refs(path: &Path, head: Option<&str>) -> Result<HistoryRefs, String> 
             "refs/remotes",
             "refs/tags",
         ],
+        MAX_HISTORY_REFS_BYTES,
     )?;
     let mut tips = BTreeSet::new();
     let mut references = Vec::new();
@@ -1464,7 +1573,7 @@ fn commit_page(
     let skip_arg = format!("--skip={skip}");
     let limit_arg = format!("--max-count={}", COMMIT_PAGE_SIZE + 1);
     let revisions = history_refs.tips.join("\n");
-    if revisions.len() > MAX_GIT_STDOUT_BYTES {
+    if revisions.len() > MAX_HISTORY_REFS_BYTES {
         return Err("Too many history references".to_owned());
     }
     let mut revisions = revisions.into_bytes();
@@ -1525,18 +1634,76 @@ fn page_commits(mut commits: Vec<Commit>, mut graph_state: GraphState) -> Commit
     }
 }
 
-#[tauri::command]
-async fn open_repository(path: String) -> Result<RepositorySummary, String> {
-    tauri::async_runtime::spawn_blocking(move || repository_summary(Path::new(&path)))
-        .await
-        .map_err(|error| format!("Could not read repository: {error}"))?
+/// What the backend remembers between IPC calls. Every command except `open_repository` only acts on the
+/// repository opened through it, so a compromised page cannot point mutations at an arbitrary directory.
+#[derive(Clone, Default)]
+struct AppState(Arc<AppStateInner>);
+
+#[derive(Default)]
+struct AppStateInner {
+    open_root: Mutex<Option<String>>,
+    /// Serializes index and COMMIT_EDITMSG writers (stage, unstage, resolve, commit, draft saves).
+    mutation: Mutex<()>,
+}
+
+impl AppState {
+    fn set_open_root(&self, root: String) {
+        *self
+            .0
+            .open_root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(root);
+    }
+
+    /// Resolves `path` to its repository root and requires it to be the open repository.
+    fn open_root(&self, path: &str) -> Result<String, String> {
+        let root = repository_root(Path::new(path))?;
+        let open = self
+            .0
+            .open_root
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if open.as_deref() == Some(root.as_str()) {
+            Ok(root)
+        } else {
+            Err("This repository is not the open repository; open it again".to_owned())
+        }
+    }
+
+    fn lock_mutations(&self) -> MutexGuard<'_, ()> {
+        self.0
+            .mutation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[tauri::command]
-async fn persist_commit_message(path: String, message: String) -> Result<(), String> {
+async fn open_repository(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<RepositorySummary, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        write_commit_message(Path::new(&root_path), &message)
+        let summary = repository_summary(Path::new(&path))?;
+        state.set_open_root(repository_root(Path::new(&summary.path))?);
+        Ok(summary)
+    })
+    .await
+    .map_err(|error| format!("Could not read repository: {error}"))?
+}
+
+#[tauri::command]
+async fn persist_commit_message(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    message: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = state.lock_mutations();
+        let root = state.open_root(&path)?;
+        write_commit_message(Path::new(&root), &message)
     })
     .await
     .map_err(|error| format!("Could not save commit message: {error}"))?
@@ -1544,16 +1711,19 @@ async fn persist_commit_message(path: String, message: String) -> Result<(), Str
 
 #[tauri::command]
 async fn commit_repository(
+    state: tauri::State<'_, AppState>,
     path: String,
     message: String,
     amend: bool,
     identity: Option<CommitIdentity>,
     persist_identity: bool,
 ) -> Result<RepositorySummary, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
+        let _mutation = state.lock_mutations();
+        let root = state.open_root(&path)?;
         commit_changes(
-            Path::new(&root_path),
+            Path::new(&root),
             &message,
             amend,
             identity,
@@ -1565,10 +1735,14 @@ async fn commit_repository(
 }
 
 #[tauri::command]
-async fn refresh_repository_status(path: String) -> Result<RepositoryStatus, String> {
+async fn refresh_repository_status(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<RepositoryStatus, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        repository_status(Path::new(&root_path))
+        let root = state.open_root(&path)?;
+        repository_status(Path::new(&root))
     })
     .await
     .map_err(|error| format!("Could not refresh repository status: {error}"))?
@@ -1576,13 +1750,15 @@ async fn refresh_repository_status(path: String) -> Result<RepositoryStatus, Str
 
 #[tauri::command]
 async fn get_file_diff(
+    state: tauri::State<'_, AppState>,
     path: String,
     path_bytes: Vec<u8>,
     group: StatusGroup,
 ) -> Result<FileDiff, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        file_diff(Path::new(&root_path), &path_bytes, group)
+        let root = state.open_root(&path)?;
+        file_diff(Path::new(&root), &path_bytes, group)
     })
     .await
     .map_err(|error| format!("Could not load file diff: {error}"))?
@@ -1590,23 +1766,32 @@ async fn get_file_diff(
 
 #[tauri::command]
 async fn resolve_conflict_file(
+    state: tauri::State<'_, AppState>,
     path: String,
     path_bytes: Vec<u8>,
     side: ConflictSide,
 ) -> Result<RepositoryStatus, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        resolve_conflict_side(Path::new(&root_path), &path_bytes, side)
+        let _mutation = state.lock_mutations();
+        let root = state.open_root(&path)?;
+        resolve_conflict_side(Path::new(&root), &path_bytes, side)
     })
     .await
     .map_err(|error| format!("Could not resolve conflict: {error}"))?
 }
 
 #[tauri::command]
-async fn stage_status_entry(path: String, path_bytes: Vec<u8>) -> Result<RepositoryStatus, String> {
+async fn stage_status_entry(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    path_bytes: Vec<u8>,
+) -> Result<RepositoryStatus, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        stage_status_path(Path::new(&root_path), &path_bytes)
+        let _mutation = state.lock_mutations();
+        let root = state.open_root(&path)?;
+        stage_status_path(Path::new(&root), &path_bytes)
     })
     .await
     .map_err(|error| format!("Could not stage file: {error}"))?
@@ -1614,12 +1799,15 @@ async fn stage_status_entry(path: String, path_bytes: Vec<u8>) -> Result<Reposit
 
 #[tauri::command]
 async fn unstage_status_entry(
+    state: tauri::State<'_, AppState>,
     path: String,
     path_bytes: Vec<u8>,
 ) -> Result<RepositoryStatus, String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        unstage_status_path(Path::new(&root_path), &path_bytes)
+        let _mutation = state.lock_mutations();
+        let root = state.open_root(&path)?;
+        unstage_status_path(Path::new(&root), &path_bytes)
     })
     .await
     .map_err(|error| format!("Could not unstage file: {error}"))?
@@ -1627,15 +1815,17 @@ async fn unstage_status_entry(
 
 #[tauri::command]
 async fn load_more_commits(
+    state: tauri::State<'_, AppState>,
     path: String,
     history_refs: HistoryRefs,
     skip: usize,
     graph_state: GraphState,
 ) -> Result<CommitPage, String> {
     validate_graph_state(&graph_state)?;
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let root_path = repository_root(Path::new(&path))?;
-        commit_page(Path::new(&root_path), &history_refs, skip, graph_state)
+        let root = state.open_root(&path)?;
+        commit_page(Path::new(&root), &history_refs, skip, graph_state)
     })
     .await
     .map_err(|error| format!("Could not read repository: {error}"))?
@@ -1645,6 +1835,7 @@ async fn load_more_commits(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             open_repository,
             load_more_commits,
@@ -2512,5 +2703,323 @@ u UU N... 100644 100644 100644 100644 abc abc abc conflict.txt\0\
         let branch = current_branch(&path).unwrap();
         let _ = fs::remove_dir_all(&path);
         assert_ne!(branch, "Detached HEAD");
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    //! GM-67 regression tests. Each one reproduces a defect on a throwaway repository.
+    use super::{
+        AppState, ConflictSide, GIT_TIMEOUT, MAX_GIT_STDOUT_BYTES, StatusGroup, StatusKind,
+        collect_output_inner, commit_changes, commit_message_metadata, commit_page, file_diff,
+        git_command, history_refs, repository_root, repository_status, resolve_conflict_side,
+        write_commit_message,
+    };
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::{Output, Stdio},
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempRepo {
+        path: PathBuf,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gitmiro-gm67-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            let repo = Self { path };
+            repo.git(&["init", "--quiet", "-b", "main"]);
+            for (key, value) in [
+                ("user.name", "GitMiro Test"),
+                ("user.email", "gitmiro-test@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.autocrlf", "false"),
+            ] {
+                repo.git(&["config", key, value]);
+            }
+            repo
+        }
+
+        fn run(&self, args: &[&str]) -> Output {
+            git_command()
+                .arg("-C")
+                .arg(&self.path)
+                .args(args)
+                .output()
+                .unwrap()
+        }
+
+        fn git(&self, args: &[&str]) -> Output {
+            let output = self.run(args);
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        fn text(&self, args: &[&str]) -> String {
+            String::from_utf8(self.git(args).stdout)
+                .unwrap()
+                .trim()
+                .to_owned()
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            fs::write(self.path.join(name), contents).unwrap();
+        }
+
+        fn commit_file(&self, name: &str, contents: &str, message: &str) {
+            self.write(name, contents);
+            self.git(&["add", name]);
+            self.git(&["commit", "--quiet", "-m", message]);
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn commits_a_merge_whose_resolved_index_equals_head() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+        repo.git(&["checkout", "--quiet", "-b", "side"]);
+        repo.commit_file("file.txt", "changed\n", "side change");
+        repo.git(&["checkout", "--quiet", "main"]);
+        repo.commit_file("file.txt", "changed\n", "same change on main");
+        repo.git(&["merge", "--no-commit", "--no-ff", "side"]);
+
+        let status = repository_status(&repo.path).unwrap();
+        assert!(status.staged.is_empty() && status.unstaged.is_empty());
+        assert!(status.merging);
+
+        commit_changes(&repo.path, "Merge side", false, None, false).unwrap();
+
+        let parents = repo.text(&["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert_eq!(parents.split(' ').count(), 3, "HEAD must be a merge commit");
+        assert!(!repository_status(&repo.path).unwrap().merging);
+    }
+
+    #[test]
+    fn a_clean_non_merge_state_still_refuses_an_empty_commit() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+
+        assert_eq!(
+            commit_changes(&repo.path, "nothing", false, None, false).err(),
+            Some("Stage changes before committing".to_owned())
+        );
+    }
+
+    #[test]
+    fn reads_the_identity_from_included_config_files() {
+        let repo = TempRepo::new();
+        repo.git(&["config", "--unset", "user.name"]);
+        repo.git(&["config", "--unset", "user.email"]);
+        fs::write(
+            repo.path.join(".git/identity.inc"),
+            "[user]\n\tname = Included Author\n\temail = included@example.invalid\n",
+        )
+        .unwrap();
+        repo.git(&["config", "include.path", "identity.inc"]);
+
+        let identity = commit_message_metadata(&repo.path).unwrap().local_identity;
+
+        assert_eq!(identity.name.as_deref(), Some("Included Author"));
+        assert_eq!(identity.email.as_deref(), Some("included@example.invalid"));
+    }
+
+    #[test]
+    fn amending_does_not_duplicate_the_sign_off() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+        fs::write(
+            repo.path.join(".git/gitnuro"),
+            "[signoff]\n\tenabled = true\n",
+        )
+        .unwrap();
+        repo.write("file.txt", "staged\n");
+        repo.git(&["add", "file.txt"]);
+        commit_changes(&repo.path, "feature", false, None, false).unwrap();
+        let previous = repo.text(&["log", "-1", "--format=%B"]);
+        assert_eq!(previous.matches("Signed-off-by").count(), 1);
+
+        commit_changes(&repo.path, &previous, true, None, false).unwrap();
+
+        let amended = repo.text(&["log", "-1", "--format=%B"]);
+        assert_eq!(amended.matches("Signed-off-by").count(), 1, "{amended}");
+    }
+
+    #[test]
+    fn a_non_utf8_commit_draft_does_not_block_opening() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+        // Latin-1 "caf\xe9" as written by another tool.
+        fs::write(repo.path.join(".git/COMMIT_EDITMSG"), b"WIP caf\xe9\n").unwrap();
+
+        let metadata = commit_message_metadata(&repo.path).unwrap();
+
+        assert!(
+            metadata.draft.starts_with("WIP caf"),
+            "{:?}",
+            metadata.draft
+        );
+    }
+
+    #[test]
+    fn a_terminal_commit_does_not_leave_a_stale_draft() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "committed in a terminal");
+        assert_eq!(commit_message_metadata(&repo.path).unwrap().draft, "");
+
+        write_commit_message(&repo.path, "work in progress").unwrap();
+        assert_eq!(
+            commit_message_metadata(&repo.path).unwrap().draft,
+            "work in progress"
+        );
+    }
+
+    #[test]
+    fn resolves_a_both_deleted_conflict() {
+        let repo = TempRepo::new();
+        let body = (0..20).map(|n| format!("line {n}\n")).collect::<String>();
+        repo.commit_file("d.txt", &body, "base");
+        repo.git(&["checkout", "--quiet", "-b", "left"]);
+        repo.git(&["mv", "d.txt", "left.txt"]);
+        repo.git(&["commit", "--quiet", "-m", "rename left"]);
+        repo.git(&["checkout", "--quiet", "-b", "right", "main"]);
+        repo.git(&["mv", "d.txt", "right.txt"]);
+        repo.git(&["commit", "--quiet", "-m", "rename right"]);
+        repo.git(&["checkout", "--quiet", "left"]);
+        assert!(!repo.run(&["merge", "right"]).status.success());
+
+        let status = repository_status(&repo.path).unwrap();
+        let both_deleted = status
+            .unstaged
+            .iter()
+            .find(|entry| entry.path == "d.txt")
+            .expect("d.txt must be reported as a conflict");
+        assert_eq!(both_deleted.kind, StatusKind::Conflicting);
+
+        let diff = file_diff(&repo.path, b"d.txt", StatusGroup::Unstaged).unwrap();
+        assert!(diff.current.is_some() && diff.incoming.is_some());
+
+        let after = resolve_conflict_side(&repo.path, b"d.txt", ConflictSide::Current).unwrap();
+        assert!(after.unstaged.iter().all(|entry| entry.path != "d.txt"));
+        assert!(
+            repo.text(&["ls-files", "--unmerged", "--", "d.txt"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn opens_a_repository_with_thousands_of_long_references() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+        let head = repo.text(&["rev-parse", "HEAD"]);
+        let updates = (0..3500)
+            .map(|n| format!("create refs/tags/release-candidate-{n:0>90} {head}\n"))
+            .collect::<String>();
+        let mut child = git_command()
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = collect_output_inner(
+            &mut child,
+            Some(updates.as_bytes()),
+            false,
+            false,
+            MAX_GIT_STDOUT_BYTES,
+            GIT_TIMEOUT,
+        )
+        .unwrap()
+        .0;
+        assert!(output.status.success());
+
+        let refs = history_refs(&repo.path, Some(&head)).unwrap();
+        assert_eq!(refs.references.len(), 3501, "3500 tags plus main");
+        let page = commit_page(&repo.path, &refs, 0, Default::default()).unwrap();
+        assert_eq!(page.commits.len(), 1);
+        assert_eq!(page.commits[0].references.len(), 3501);
+    }
+
+    #[test]
+    fn stops_a_git_process_that_never_finishes() {
+        let repo = TempRepo::new();
+        // Waits for stdin, which stays open: stands in for a credential prompt or a stuck hook.
+        let mut child = git_command()
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["hash-object", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let error = collect_output_inner(
+            &mut child,
+            None,
+            false,
+            false,
+            MAX_GIT_STDOUT_BYTES,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("did not finish"), "{error}");
+    }
+
+    #[test]
+    fn never_runs_a_repository_configured_fsmonitor_command() {
+        let repo = TempRepo::new();
+        repo.commit_file("file.txt", "base\n", "base");
+        repo.git(&[
+            "config",
+            "core.fsmonitor",
+            "echo ran > fsmonitor-marker.txt",
+        ]);
+        let marker = repo.path.join("fsmonitor-marker.txt");
+
+        repository_status(&repo.path).unwrap();
+
+        assert!(!marker.exists(), "core.fsmonitor command was executed");
+    }
+
+    #[test]
+    fn only_the_opened_repository_is_accepted_by_commands() {
+        let opened = TempRepo::new();
+        let other = TempRepo::new();
+        let state = AppState::default();
+        let opened_path = opened.path.to_str().unwrap();
+        let other_path = other.path.to_str().unwrap();
+
+        assert!(state.open_root(opened_path).is_err(), "nothing is open yet");
+        state.set_open_root(repository_root(Path::new(opened_path)).unwrap());
+
+        assert!(state.open_root(opened_path).is_ok());
+        assert!(state.open_root(other_path).is_err());
+        assert!(state.open_root("Z:/does/not/exist").is_err());
     }
 }
