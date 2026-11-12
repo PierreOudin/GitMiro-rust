@@ -1686,7 +1686,8 @@ async fn open_repository(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let summary = repository_summary(Path::new(&path))?;
-        state.set_open_root(repository_root(Path::new(&summary.path))?);
+        // summary.path is the root Git reported; reusing it saves a Git spawn.
+        state.set_open_root(summary.path.clone());
         Ok(summary)
     })
     .await
