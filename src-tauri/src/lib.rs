@@ -27,7 +27,10 @@ const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Git command that never creates a console window (the release build uses the GUI subsystem, so each spawn would otherwise allocate a console host).
 fn git_command() -> Command {
     let mut command = Command::new("git");
-    // A repository can set core.fsmonitor to a command that Git then runs on every status; never honor it.
+    // Threat model: an opened repository may come from an untrusted source (unzipped copy, shared drive) whose
+    // .git/config and hooks Git will honor. Hardened here and in the callers: core.fsmonitor (runs on status),
+    // log signature programs, diff.external and textconv (--no-ext-diff, --no-textconv), prompts, hangs (timeouts).
+    // Accepted residual risk, as with the Git CLI itself: hooks on commit and clean filters on add/diff.
     command.args(["-c", "core.fsmonitor=false"]);
     command.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(windows)]
@@ -271,6 +274,23 @@ fn collect_output_capped_and_killing_on_truncation(child: Child) -> Result<(Outp
     )
 }
 
+/// Stops Git and everything it started. On Windows `git.exe` on PATH can be a launcher (`cmd/git.exe`) that spawns the
+/// real Git; killing the tree keeps a timed-out Git from leaving index.lock or hooks behind. (On Git 2.51 for Windows
+/// plain `Child::kill` also stopped the real process in testing, so this is defence in depth.)
+fn kill_process_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        taskkill
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        std::os::windows::process::CommandExt::creation_flags(&mut taskkill, 0x0800_0000); // CREATE_NO_WINDOW
+        let _ = taskkill.status();
+    }
+    let _ = child.kill();
+}
+
 fn collect_output_inner(
     child: &mut Child,
     input: Option<&[u8]>,
@@ -286,29 +306,31 @@ fn collect_output_inner(
     let stdout_reader =
         thread::spawn(move || read_capped_signaling(stdout, stdout_limit, stdout_reader_overflow));
     let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_GIT_STDERR_BYTES));
-    if let Some(input) = input {
-        let result = child.stdin.take().expect("piped stdin").write_all(input);
-        if let Err(error) = result {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(format!("Could not write Git input: {error}"));
-        }
-    }
+    // Written on its own thread: a hook can run for a long time before Git reads stdin, and Git can exit without
+    // reading it (rejecting hook). Its own exit status and stderr then explain the failure, so write errors are ignored.
+    let stdin_writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        })
+    });
     // Poll instead of blocking in wait() so a hung Git (credential or signing prompt, stuck hook) can be killed.
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_micros(250);
+    let mut killed_on_overflow = false;
     let status = loop {
-        if stdout_overflow.load(Ordering::Relaxed) {
-            let _ = child.kill();
+        if !killed_on_overflow && stdout_overflow.load(Ordering::Relaxed) {
+            killed_on_overflow = true;
+            kill_process_tree(child);
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(child);
                 let _ = child.wait();
-                // The readers are left to finish on their own: a hook that outlived Git may still hold the pipes.
+                // The readers and the writer are left to finish on their own: a process that escaped the kill
+                // may still hold the pipes.
                 return Err(format!(
                     "Git did not finish within {} seconds and was stopped",
                     timeout.as_secs()
@@ -319,14 +341,15 @@ fn collect_output_inner(
                 delay = (delay * 2).min(Duration::from_millis(2));
             }
             Err(error) => {
-                let _ = child.kill();
+                kill_process_tree(child);
                 let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
                 return Err(format!("Could not wait for Git: {error}"));
             }
         }
     };
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
     let (stdout, stdout_truncated) = stdout_reader
         .join()
         .map_err(|_| "Could not read Git output".to_owned())?
@@ -1558,13 +1581,14 @@ fn commit_page(
     if history_refs.tips.is_empty() {
         return Ok(page_commits(Vec::new(), graph_state));
     }
+    let known_tips: BTreeSet<&str> = history_refs.tips.iter().map(String::as_str).collect();
     if history_refs.tips.iter().any(|tip| !is_commit_id(tip))
         || history_refs.references.iter().any(|reference| {
             !is_commit_id(&reference.id)
                 || reference.name.is_empty()
                 || reference.name.len() > 1024
                 || reference.name.chars().any(char::is_control)
-                || !history_refs.tips.contains(&reference.id)
+                || !known_tips.contains(reference.id.as_str())
         })
     {
         return Err("Invalid history commit ID".to_owned());
@@ -1582,6 +1606,8 @@ fn commit_page(
         "log",
         "--stdin",
         "--date-order",
+        // A repository can set log.showSignature and gpg.program; never run a program while listing history.
+        "--no-show-signature",
         skip_arg.as_str(),
         limit_arg.as_str(),
         "--format=%H%x00%P%x00%<(256,trunc)%s%x00%<(256,trunc)%an%x00%aI%x00",
@@ -1635,7 +1661,9 @@ fn page_commits(mut commits: Vec<Commit>, mut graph_state: GraphState) -> Commit
 }
 
 /// What the backend remembers between IPC calls. Every command except `open_repository` only acts on the
-/// repository opened through it, so a compromised page cannot point mutations at an arbitrary directory.
+/// repository last opened through it, so a stale or mismatched call (an old tab state, a request that outlived a
+/// repository switch) cannot touch another directory. It is not a barrier against a compromised page: that page
+/// can still call `open_repository` with any directory, which is why the CSP and capabilities stay minimal.
 #[derive(Clone, Default)]
 struct AppState(Arc<AppStateInner>);
 
@@ -1657,12 +1685,17 @@ impl AppState {
 
     /// Resolves `path` to its repository root and requires it to be the open repository.
     fn open_root(&self, path: &str) -> Result<String, String> {
-        let root = repository_root(Path::new(path))?;
         let open = self
             .0
             .open_root
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // The page sends back the root Git reported, so the usual call needs no Git spawn to be recognized.
+        if let Some(open) = open.as_deref().filter(|open| *open == path) {
+            return Ok(open.to_owned());
+        }
+        let root = repository_root(Path::new(path))?;
         if open.as_deref() == Some(root.as_str()) {
             Ok(root)
         } else {
@@ -3022,5 +3055,76 @@ mod regression_tests {
         assert!(state.open_root(opened_path).is_ok());
         assert!(state.open_root(other_path).is_err());
         assert!(state.open_root("Z:/does/not/exist").is_err());
+    }
+
+    #[test]
+    fn a_hook_rejecting_a_large_message_still_reports_its_own_output() {
+        let repo = TempRepo::new();
+        fs::create_dir(repo.path.join("hooks")).unwrap();
+        fs::write(
+            repo.path.join("hooks/pre-commit"),
+            "#!/bin/sh
+echo 'HOOK REJECTED' >&2
+exit 1
+",
+        )
+        .unwrap();
+        repo.git(&["config", "core.hooksPath", "hooks"]);
+        repo.write(
+            "staged.txt",
+            "staged
+",
+        );
+        repo.git(&["add", "staged.txt"]);
+        // Far larger than a pipe buffer: Git exits before reading it, which used to surface as a BrokenPipe error.
+        let message = "long line of commit message
+"
+        .repeat(10_000);
+
+        let error = commit_changes(&repo.path, &message, false, None, false)
+            .err()
+            .expect("the hook must reject the commit");
+
+        assert!(error.contains("HOOK REJECTED"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_timeout_stops_the_whole_git_process_tree() {
+        let repo = TempRepo::new();
+        let marker = format!("gm67-kill-marker-{}", std::process::id());
+        // The launcher layout (cmd/git.exe starting mingw64/bin/git.exe) is what PATH gives most Windows users.
+        let launcher = Path::new("C:/Program Files/Git/cmd/git.exe");
+        if !launcher.exists() {
+            return;
+        }
+        let mut child = std::process::Command::new(launcher)
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["hash-object", "--stdin", &format!("--path={marker}")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        collect_output_inner(
+            &mut child,
+            None,
+            false,
+            false,
+            MAX_GIT_STDOUT_BYTES,
+            Duration::from_millis(1500),
+        )
+        .unwrap_err();
+
+        // git.exe on PATH is a launcher; the real Git it started must be gone too.
+        let query = format!(
+            "(Get-CimInstance Win32_Process -Filter \"Name='git.exe'\" | Where-Object {{ $_.CommandLine -like '*{marker}*' }} | Measure-Object).Count"
+        );
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &query])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
     }
 }

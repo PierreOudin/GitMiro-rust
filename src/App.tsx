@@ -219,6 +219,13 @@ function App() {
     }
   }
 
+  // Inputs are disabled while committing, which drops the focus to <body>; hand it back to the message box.
+  useEffect(() => {
+    if (!committing && (document.activeElement === document.body || document.activeElement === null)) {
+      document.getElementById("commit-message")?.focus();
+    }
+  }, [committing]);
+
   // Give the focus back to what opened the dialog once it is gone.
   useEffect(() => {
     if (!identityPrompt && identityOpenerRef.current) {
@@ -348,6 +355,7 @@ function App() {
       // Opening another repository is blocked while committing; still never let a late result replace the visible one.
       if (repositoryPathRef.current !== targetPath) return;
       setRepository(updated);
+      loadMoreFailedRef.current = false; // the history was replaced; an earlier page failure no longer applies
       setCommitMessage(updated.commit.draft);
       setIsAmend(false);
       setIdentityPrompt(null);
@@ -360,7 +368,10 @@ function App() {
     } catch (error) {
       const message = String(error);
       setCommitError(message);
-      if (identity) setIdentityError(message); // the dialog hides the composer where the error is otherwise shown
+      if (identity) {
+        setIdentityError(message); // the dialog hides the composer where the error is otherwise shown
+        document.getElementById("author-name")?.focus(); // Continue is about to be disabled; keep the focus in the dialog
+      }
     } finally {
       committingRef.current = false;
       setCommitting(false);
@@ -645,7 +656,7 @@ function App() {
                     </select>
                   </div>
                   {repository.commits.length ? (
-                    <div className="commit-history" onScroll={loadMoreWhenScrolledToEnd} style={{ "--graph-width": `${Math.max(40, Math.max(...repository.commits.map(({ lane }) => lane)) * GRAPH_LANE_WIDTH + 36)}px` } as CSSProperties}>
+                    <div className="commit-history" onScroll={loadMoreWhenScrolledToEnd} style={{ "--graph-width": `${Math.max(40, repository.commits.reduce((widest, { lane }) => Math.max(widest, lane), 0) * GRAPH_LANE_WIDTH + 36)}px` } as CSSProperties}>
                       <ol className="commit-list">
                         {repository.commits.map((commit) => (
                           <li className={reachableCommits && !reachableCommits.has(commit.id) ? "commit-dimmed" : undefined} key={commit.id}>
@@ -708,7 +719,7 @@ function App() {
                           changeCommitMessage(repository.commit.previous_message);
                         }
                       }}
-                      disabled={committing}
+                      disabled={committing || repository.status.merging}
                     />
                     Amend previous commit
                   </label>
