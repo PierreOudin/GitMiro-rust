@@ -141,6 +141,8 @@ function App() {
   const [diffError, setDiffError] = useState<string | null>(null);
   const [commitMessage, setCommitMessage] = useState("");
   const [isAmend, setIsAmend] = useState(false);
+  // A merge in progress cannot be amended (Git refuses), whatever the box was ticked to before the merge began.
+  const amending = isAmend && !repository?.status.merging;
   const [committing, setCommitting] = useState(false);
   const [commitError, setCommitError] = useState<string | null>(null);
   const [identityPrompt, setIdentityPrompt] = useState<{ name: string; email: string; save: boolean } | null>(null);
@@ -320,8 +322,8 @@ function App() {
   async function commitChanges(identity?: { name: string; email: string }, persistIdentity = false) {
     if (!repository || committingRef.current || changingStatusRef.current) return;
     // A merge can be concluded with nothing staged (its result may equal HEAD).
-    if (!commitMessage.length || (!isAmend && repository.status.staged.length === 0 && !repository.status.merging)) return;
-    if (isAmend && !repository.history_head) return;
+    if (!commitMessage.length || (!amending && repository.status.staged.length === 0 && !repository.status.merging)) return;
+    if (amending && !repository.history_head) return;
     if (!identity && identityNeedsInput(repository.commit)) {
       identityOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setIdentityError(null);
@@ -348,7 +350,7 @@ function App() {
       const updated = await invoke<RepositorySummary>("commit_repository", {
         path: targetPath,
         message: commitMessage,
-        amend: isAmend,
+        amend: amending,
         identity: identity ?? null,
         persistIdentity,
       });
@@ -711,7 +713,7 @@ function App() {
                   <label className="amend-option">
                     <input
                       type="checkbox"
-                      checked={isAmend}
+                      checked={amending}
                       onChange={(event) => {
                         const amend = event.target.checked;
                         setIsAmend(amend);
@@ -728,9 +730,9 @@ function App() {
                   className="button button-primary"
                   type="button"
                   onClick={() => void commitChanges()}
-                  disabled={committing || changingStatus || !commitMessage.length || (!isAmend && !repository.status.staged.length && !repository.status.merging)}
+                  disabled={committing || changingStatus || !commitMessage.length || (!amending && !repository.status.staged.length && !repository.status.merging)}
                 >
-                  {committing ? "Committing…" : isAmend ? "Amend commit" : repository.status.merging ? "Commit merge" : "Commit staged changes"}
+                  {committing ? "Committing…" : amending ? "Amend commit" : repository.status.merging ? "Commit merge" : "Commit staged changes"}
                 </button>
                 {commitError && <p className="error-message" role="alert">{commitError}</p>}
               </section>
@@ -888,7 +890,7 @@ function App() {
             </label>
             {identityError && <p className="error-message" role="alert">{identityError}</p>}
             <footer>
-              <button className="button button-secondary" type="button" onClick={() => setIdentityPrompt(null)}>Cancel</button>
+              <button className="button button-secondary" type="button" disabled={committing} onClick={() => setIdentityPrompt(null)}>Cancel</button>
               <button className="button button-primary" type="submit" disabled={committing}>Continue</button>
             </footer>
           </form>

@@ -9,6 +9,7 @@ use std::{
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -20,6 +21,8 @@ const COMMIT_PAGE_SIZE: usize = 500;
 const MAX_GRAPH_LANES: usize = 4096;
 /// Reference listings grow with the repository (about 100 bytes per ref), so they get a larger cap than diffs.
 const MAX_HISTORY_REFS_BYTES: usize = 16 * 1024 * 1024;
+/// How long to wait for Git's pipes to close after Git itself has exited.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Commits may run slow hooks or wait for a signing prompt.
 const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -29,10 +32,20 @@ fn git_command() -> Command {
     let mut command = Command::new("git");
     // Threat model: an opened repository may come from an untrusted source (unzipped copy, shared drive) whose
     // .git/config and hooks Git will honor. Hardened here and in the callers: core.fsmonitor (runs on status),
-    // log signature programs, diff.external and textconv (--no-ext-diff, --no-textconv), prompts, hangs (timeouts).
-    // Accepted residual risk, as with the Git CLI itself: hooks on commit and clean filters on add/diff.
-    command.args(["-c", "core.fsmonitor=false"]);
+    // log.showSignature (runs gpg.program on log), diff.external and textconv (--no-ext-diff, --no-textconv),
+    // prompts and inherited stdin, hangs (timeouts).
+    // NOT hardened, as with the Git CLI itself, because Git offers no switch: hooks and gpg programs on commit,
+    // and filter.<name>.clean/smudge commands, which can run on status (stat-dirty files), add, diff and checkout.
+    // Opening a repository from an untrusted source is therefore running its configuration. A "trust this
+    // repository" prompt before the first status is the follow-up if that matters.
+    command.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "log.showSignature=false",
+    ]);
     command.env("GIT_TERMINAL_PROMPT", "0");
+    command.stdin(Stdio::null()); // callers that feed Git override this with a pipe
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000); // CREATE_NO_WINDOW
     command
@@ -274,13 +287,18 @@ fn collect_output_capped_and_killing_on_truncation(child: Child) -> Result<(Outp
     )
 }
 
-/// Stops Git and everything it started. On Windows `git.exe` on PATH can be a launcher (`cmd/git.exe`) that spawns the
-/// real Git; killing the tree keeps a timed-out Git from leaving index.lock or hooks behind. (On Git 2.51 for Windows
-/// plain `Child::kill` also stopped the real process in testing, so this is defence in depth.)
+/// Stops Git and, on Windows, the processes it started (a hook, a filter, a signing program): `Child::kill` alone
+/// leaves them running. The kill is forced, so Git cannot clean up after itself: a timed-out write command can leave
+/// `.git/index.lock` behind, and the next write then fails until that file is removed. Elsewhere only Git is killed.
 fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
-        let mut taskkill = Command::new("taskkill");
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:/Windows".into());
+        let mut taskkill = Command::new(
+            Path::new(&system_root)
+                .join("System32")
+                .join("taskkill.exe"),
+        );
         taskkill
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .stdout(Stdio::null())
@@ -289,6 +307,23 @@ fn kill_process_tree(child: &mut Child) {
         let _ = taskkill.status();
     }
     let _ = child.kill();
+}
+
+type Drained = io::Result<(Vec<u8>, bool)>;
+
+/// Waits for a reader thread until `deadline`; `None` means the pipe is still open.
+fn drained(
+    receiver: &mpsc::Receiver<Drained>,
+    deadline: Instant,
+    what: &str,
+) -> Result<Option<(Vec<u8>, bool)>, String> {
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result
+            .map(Some)
+            .map_err(|error| format!("Could not read {what}: {error}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!("Could not read {what}")),
+    }
 }
 
 fn collect_output_inner(
@@ -303,18 +338,28 @@ fn collect_output_inner(
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout_overflow = Arc::new(AtomicBool::new(false));
     let stdout_reader_overflow = kill_on_truncated_stdout.then(|| Arc::clone(&stdout_overflow));
-    let stdout_reader =
-        thread::spawn(move || read_capped_signaling(stdout, stdout_limit, stdout_reader_overflow));
-    let stderr_reader = thread::spawn(move || read_capped(stderr, MAX_GIT_STDERR_BYTES));
+    // Results travel over channels so that waiting for them can be bounded (see below).
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = stdout_tx.send(read_capped_signaling(
+            stdout,
+            stdout_limit,
+            stdout_reader_overflow,
+        ));
+    });
+    thread::spawn(move || {
+        let _ = stderr_tx.send(read_capped(stderr, MAX_GIT_STDERR_BYTES));
+    });
     // Written on its own thread: a hook can run for a long time before Git reads stdin, and Git can exit without
     // reading it (rejecting hook). Its own exit status and stderr then explain the failure, so write errors are ignored.
-    let stdin_writer = input.map(|input| {
+    if let Some(input) = input {
         let mut stdin = child.stdin.take().expect("piped stdin");
         let input = input.to_vec();
         thread::spawn(move || {
             let _ = stdin.write_all(&input);
-        })
-    });
+        });
+    }
     // Poll instead of blocking in wait() so a hung Git (credential or signing prompt, stuck hook) can be killed.
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_micros(250);
@@ -347,17 +392,31 @@ fn collect_output_inner(
             }
         }
     };
-    if let Some(writer) = stdin_writer {
-        let _ = writer.join();
+    // Git has exited, but a process it started (a hook running `cmd &`) can keep the pipes open for as long as it
+    // lives. Do not wait for it past a short grace: the exit status is what matters then.
+    let drain_deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    let mut pipes_held_open = false;
+    let (stdout, stdout_truncated) = match drained(&stdout_rx, drain_deadline, "Git output")? {
+        Some(result) => result,
+        None => {
+            pipes_held_open = true;
+            (Vec::new(), false)
+        }
+    };
+    let (mut stderr, stderr_truncated) =
+        match drained(&stderr_rx, drain_deadline, "Git error output")? {
+            Some(result) => result,
+            None => {
+                pipes_held_open = true;
+                (Vec::new(), false)
+            }
+        };
+    if pipes_held_open {
+        stderr.extend_from_slice(
+            b"
+[Git output was cut: a process started by Git kept its pipes open]",
+        );
     }
-    let (stdout, stdout_truncated) = stdout_reader
-        .join()
-        .map_err(|_| "Could not read Git output".to_owned())?
-        .map_err(|error| format!("Could not read Git output: {error}"))?;
-    let (mut stderr, stderr_truncated) = stderr_reader
-        .join()
-        .map_err(|_| "Could not read Git error output".to_owned())?
-        .map_err(|error| format!("Could not read Git error output: {error}"))?;
 
     if stdout_truncated && !allow_truncated_stdout {
         return Err(format!(
@@ -2816,6 +2875,17 @@ mod regression_tests {
             fs::write(self.path.join(name), contents).unwrap();
         }
 
+        /// Writes a script (hook, fake gpg) that Git can execute on every platform.
+        fn write_executable(&self, relative: &str, contents: &str) {
+            let path = self.path.join(relative);
+            fs::write(&path, contents).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
         fn commit_file(&self, name: &str, contents: &str, message: &str) {
             self.write(name, contents);
             self.git(&["add", name]);
@@ -3061,14 +3131,13 @@ mod regression_tests {
     fn a_hook_rejecting_a_large_message_still_reports_its_own_output() {
         let repo = TempRepo::new();
         fs::create_dir(repo.path.join("hooks")).unwrap();
-        fs::write(
-            repo.path.join("hooks/pre-commit"),
+        repo.write_executable(
+            "hooks/pre-commit",
             "#!/bin/sh
 echo 'HOOK REJECTED' >&2
 exit 1
 ",
-        )
-        .unwrap();
+        );
         repo.git(&["config", "core.hooksPath", "hooks"]);
         repo.write(
             "staged.txt",
@@ -3090,23 +3159,16 @@ exit 1
 
     #[cfg(windows)]
     #[test]
-    fn a_timeout_stops_the_whole_git_process_tree() {
-        let repo = TempRepo::new();
-        let marker = format!("gm67-kill-marker-{}", std::process::id());
-        // The launcher layout (cmd/git.exe starting mingw64/bin/git.exe) is what PATH gives most Windows users.
-        let launcher = Path::new("C:/Program Files/Git/cmd/git.exe");
-        if !launcher.exists() {
-            return;
-        }
-        let mut child = std::process::Command::new(launcher)
-            .arg("-C")
-            .arg(&repo.path)
-            .args(["hash-object", "--stdin", &format!("--path={marker}")])
+    fn a_timeout_stops_processes_started_by_git() {
+        // cmd.exe stands in for a hook shell: a plain Child::kill leaves its ping.exe child running.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 47 -l 13 127.0.0.2"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+
         collect_output_inner(
             &mut child,
             None,
@@ -3117,14 +3179,128 @@ exit 1
         )
         .unwrap_err();
 
-        // git.exe on PATH is a launcher; the real Git it started must be gone too.
-        let query = format!(
-            "(Get-CimInstance Win32_Process -Filter \"Name='git.exe'\" | Where-Object {{ $_.CommandLine -like '*{marker}*' }} | Measure-Object).Count"
-        );
+        let query = "(Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object { $_.CommandLine -like '*-l 13 127.0.0.2*' }).ProcessId";
         let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &query])
+            .args(["-NoProfile", "-Command", query])
             .output()
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+        let survivors = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        for pid in survivors.lines() {
+            // Never leave a stray process behind, even when the assertion below fails.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", pid.trim(), "/F"])
+                .output();
+        }
+        assert!(
+            survivors.is_empty(),
+            "ping.exe survived the kill: {survivors}"
+        );
+    }
+
+    #[test]
+    fn never_runs_a_repository_configured_signature_program() {
+        let repo = TempRepo::new();
+        repo.commit_file(
+            "file.txt", "base
+", "base",
+        );
+        // Turn HEAD into a commit carrying a (fake) gpgsig header.
+        let tree = repo.text(&["rev-parse", "HEAD^{tree}"]);
+        let commit = format!(
+            "tree {tree}
+author A <a@b.c> 1700000000 +0000
+committer A <a@b.c> 1700000000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ fake
+ -----END PGP SIGNATURE-----
+
+signed
+"
+        );
+        let commit_file = repo.path.join(".git/signed-commit.txt");
+        fs::write(&commit_file, commit).unwrap();
+        let id = repo.text(&[
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            commit_file.to_str().unwrap(),
+        ]);
+        repo.git(&["update-ref", "refs/heads/main", &id]);
+        let marker = repo.path.join(".git/gpg-marker.txt");
+        let slashed = |path: &Path| {
+            path.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        };
+        repo.write_executable(
+            ".git/fake-gpg",
+            &format!(
+                "#!/bin/sh
+echo ran > \"{}\"
+exit 1
+",
+                slashed(&marker)
+            ),
+        );
+        repo.git(&["config", "log.showSignature", "true"]);
+        repo.git(&[
+            "config",
+            "gpg.program",
+            &slashed(&repo.path.join(".git/fake-gpg")),
+        ]);
+
+        // Precondition: the plain Git CLI does run the program.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo.path)
+            .args(["log", "-1"])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "precondition: Git must run gpg.program here"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        commit_message_metadata(&repo.path).unwrap();
+        let refs = history_refs(&repo.path, None).unwrap();
+        commit_page(&repo.path, &refs, 0, Default::default()).unwrap();
+
+        assert!(
+            !marker.exists(),
+            "gpg.program was executed while reading history"
+        );
+    }
+
+    #[test]
+    fn a_commit_does_not_wait_for_a_process_its_hook_left_running() {
+        let repo = TempRepo::new();
+        fs::create_dir(repo.path.join("hooks")).unwrap();
+        // The background process inherits Git's pipes and outlives it.
+        repo.write_executable(
+            "hooks/pre-commit",
+            "#!/bin/sh
+sleep 25 &
+exit 0
+",
+        );
+        repo.git(&["config", "core.hooksPath", "hooks"]);
+        repo.write(
+            "staged.txt",
+            "staged
+",
+        );
+        repo.git(&["add", "staged.txt"]);
+        let started = std::time::Instant::now();
+
+        commit_changes(&repo.path, "committed", false, None, false).unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "waited {:?} for the hook's background process",
+            started.elapsed()
+        );
+        assert_eq!(repo.text(&["log", "-1", "--format=%s"]), "committed");
     }
 }
