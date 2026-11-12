@@ -2,8 +2,9 @@ import "./App.css";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type KeyboardEvent, type UIEvent, useEffect, useMemo, useRef, useState } from "react";
 import { reachableCommitIds } from "./history-filter";
+import { isNearEnd } from "./scroll";
 
 type GraphState = { reserved_lanes: Record<string, string> };
 
@@ -28,7 +29,7 @@ type CommitMetadata = {
   global_identity: CommitIdentity;
 };
 
-type RepositoryStatus = { staged: StatusEntry[]; unstaged: StatusEntry[]; truncated: boolean };
+type RepositoryStatus = { staged: StatusEntry[]; unstaged: StatusEntry[]; truncated: boolean; merging: boolean };
 type StatusEntry = { path: string; path_bytes: number[]; kind: "added" | "modified" | "removed" | "conflicting" };
 type StatusGroup = "staged" | "unstaged";
 type ConflictVersion = { kind: "text" | "binary" | "submodule" | "deleted" | "tooLarge"; content: string | null };
@@ -144,9 +145,13 @@ function App() {
   const [commitError, setCommitError] = useState<string | null>(null);
   const [identityPrompt, setIdentityPrompt] = useState<{ name: string; email: string; save: boolean } | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
+  const [openGeneration, setOpenGeneration] = useState(0);
   const selectedDiffRef = useRef<typeof selectedDiff>(null);
   const openingRef = useRef(false);
   const loadingMoreRef = useRef(false);
+  const loadMoreFailedRef = useRef(false);
+  const repositoryPathRef = useRef<string | null>(null);
+  const identityOpenerRef = useRef<HTMLElement | null>(null);
   const changingStatusRef = useRef(false);
   const committingRef = useRef(false);
   const commitPersistTimerRef = useRef<number | null>(null);
@@ -156,16 +161,19 @@ function App() {
   const repositoryHeadingRef = useRef<HTMLHeadingElement>(null);
   const recentRepositoryRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
+  repositoryPathRef.current = repository?.path ?? null;
+
+  // Only when a repository is opened: status refreshes replace `repository` and must not move the focus.
   useEffect(() => {
-    if (repository) repositoryHeadingRef.current?.focus();
-  }, [repository]);
+    if (openGeneration > 0) repositoryHeadingRef.current?.focus();
+  }, [openGeneration]);
 
   useEffect(() => {
     if (!repository) return;
     let active = true;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-      if (!focused || changingStatusRef.current) return;
+      if (!focused || changingStatusRef.current || committingRef.current) return;
       const refreshId = ++statusRefreshRef.current;
       void invoke<RepositoryStatus>("refresh_repository_status", { path: repository.path })
         .then((status) => {
@@ -187,19 +195,40 @@ function App() {
     };
   }, [repository?.path]);
 
-  useEffect(() => {
-    if (!repository?.has_more_commits || loadingMore) return;
-    const loadAtEnd = () => {
-      if (document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 200) {
-        void loadMoreCommits();
+  // The list scrolls inside .commit-history, not the window. After a failed page the manual button retries.
+  function loadMoreWhenScrolledToEnd(event: UIEvent<HTMLDivElement>) {
+    if (!loadMoreFailedRef.current && isNearEnd(event.currentTarget)) void loadMoreCommits();
+  }
+
+  // Escape closes the identity dialog; Tab cycles inside it (it is aria-modal).
+  function keepFocusInDialog(event: KeyboardEvent<HTMLFormElement>) {
+    if (event.key === "Escape" && !committingRef.current) {
+      event.preventDefault();
+      setIdentityPrompt(null);
+    } else if (event.key === "Tab") {
+      const items = event.currentTarget.querySelectorAll<HTMLElement>("input, button:not([disabled])");
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
       }
-    };
-    window.addEventListener("scroll", loadAtEnd);
-    return () => window.removeEventListener("scroll", loadAtEnd);
-  }, [repository?.path, repository?.commits.length, repository?.has_more_commits, loadingMore]);
+    }
+  }
+
+  // Give the focus back to what opened the dialog once it is gone.
+  useEffect(() => {
+    if (!identityPrompt && identityOpenerRef.current) {
+      identityOpenerRef.current.focus();
+      identityOpenerRef.current = null;
+    }
+  }, [identityPrompt === null]);
 
   async function openRepository() {
-    if (openingRef.current) return;
+    if (openingRef.current || committingRef.current) return;
     openingRef.current = true;
     setOpening(true);
     setError(null);
@@ -219,6 +248,7 @@ function App() {
     const opened = await invoke<RepositorySummary>("open_repository", { path });
     historyRequestRef.current++;
     loadingMoreRef.current = false;
+    loadMoreFailedRef.current = false;
     setLoadingMore(false);
     setHistoryFilter("");
     statusRefreshRef.current++;
@@ -237,6 +267,7 @@ function App() {
     setFileDiff(null);
     setDiffError(null);
     setRepository(opened);
+    setOpenGeneration((generation) => generation + 1);
     setRecentRepositories((current) => [opened.path, ...current.filter((recent) => recent !== opened.path)]);
   }
 
@@ -281,9 +312,11 @@ function App() {
 
   async function commitChanges(identity?: { name: string; email: string }, persistIdentity = false) {
     if (!repository || committingRef.current || changingStatusRef.current) return;
-    if (!commitMessage.length || (!isAmend && repository.status.staged.length === 0)) return;
+    // A merge can be concluded with nothing staged (its result may equal HEAD).
+    if (!commitMessage.length || (!isAmend && repository.status.staged.length === 0 && !repository.status.merging)) return;
     if (isAmend && !repository.history_head) return;
     if (!identity && identityNeedsInput(repository.commit)) {
+      identityOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setIdentityError(null);
       setIdentityPrompt({
         name: repository.commit.local_identity.name ?? repository.commit.global_identity.name ?? "",
@@ -296,7 +329,9 @@ function App() {
     committingRef.current = true;
     setCommitting(true);
     setCommitError(null);
+    setIdentityError(null);
     const targetPath = repository.path;
+    statusRefreshRef.current++; // a status read that started before the commit would show the old index
     if (commitPersistTimerRef.current !== null) {
       window.clearTimeout(commitPersistTimerRef.current);
       commitPersistTimerRef.current = null;
@@ -310,13 +345,22 @@ function App() {
         identity: identity ?? null,
         persistIdentity,
       });
+      // Opening another repository is blocked while committing; still never let a late result replace the visible one.
+      if (repositoryPathRef.current !== targetPath) return;
       setRepository(updated);
       setCommitMessage(updated.commit.draft);
       setIsAmend(false);
       setIdentityPrompt(null);
-      setIdentityError(null);
+      const selection = selectedDiffRef.current;
+      if (selection) {
+        const entry = updated.status[selection.group].find((candidate) => samePathBytes(candidate.path_bytes, selection.pathBytes));
+        if (entry) void viewFileDiff(entry, selection.group);
+        else closeFileDiff();
+      }
     } catch (error) {
-      setCommitError(String(error));
+      const message = String(error);
+      setCommitError(message);
+      if (identity) setIdentityError(message); // the dialog hides the composer where the error is otherwise shown
     } finally {
       committingRef.current = false;
       setCommitting(false);
@@ -367,7 +411,10 @@ function App() {
           : current);
       }
     } catch (error) {
-      if (requestId === historyRequestRef.current) setError(String(error));
+      if (requestId === historyRequestRef.current) {
+        loadMoreFailedRef.current = true; // scrolling must not hammer Git; the button retries
+        setError(String(error));
+      }
     } finally {
       if (requestId === historyRequestRef.current) {
         loadingMoreRef.current = false;
@@ -410,7 +457,7 @@ function App() {
   }
 
   async function changeStatusEntry(entry: StatusEntry, action: "stage" | "unstage") {
-    if (!repository || changingStatusRef.current) return;
+    if (!repository || changingStatusRef.current || committingRef.current) return;
     const targetPath = repository.path;
     changingStatusRef.current = true;
     setChangingStatus(true);
@@ -440,7 +487,7 @@ function App() {
   }
 
   async function resolveConflict(pathBytes: number[], side: "current" | "incoming") {
-    if (!repository || changingStatusRef.current) return;
+    if (!repository || changingStatusRef.current || committingRef.current) return;
     const targetPath = repository.path;
     changingStatusRef.current = true;
     setChangingStatus(true);
@@ -484,10 +531,11 @@ function App() {
               </div>
               <span className="branch-label">{repository.branch}</span>
             </div>
-            <button className="button button-secondary" onClick={openRepository} disabled={opening || changingStatus}>
+            <button className="button button-secondary" onClick={openRepository} disabled={opening || changingStatus || committing}>
               {opening ? "Opening…" : "Open another"}
             </button>
           </header>
+          {error && <p className="error-message repository-error" role="alert">{error}</p>}
           <div className="repository-layout">
             <aside className="reference-sidebar" aria-label="Repository references">
               {REFERENCE_GROUPS.map(({ kind, label }) => (
@@ -544,7 +592,7 @@ function App() {
                                   className="button button-secondary"
                                   type="button"
                                   onClick={() => void resolveConflict(selectedDiff.pathBytes, side)}
-                                  disabled={changingStatus}
+                                  disabled={changingStatus || committing}
                                 >
                                   {version.kind === "deleted" ? `Keep ${side} (delete)` : `Keep ${side}`}
                                 </button>
@@ -596,9 +644,8 @@ function App() {
                       ))}
                     </select>
                   </div>
-                  {error && <p className="error-message" role="alert">{error}</p>}
                   {repository.commits.length ? (
-                    <div className="commit-history" style={{ "--graph-width": `${Math.max(40, Math.max(...repository.commits.map(({ lane }) => lane)) * GRAPH_LANE_WIDTH + 36)}px` } as CSSProperties}>
+                    <div className="commit-history" onScroll={loadMoreWhenScrolledToEnd} style={{ "--graph-width": `${Math.max(40, Math.max(...repository.commits.map(({ lane }) => lane)) * GRAPH_LANE_WIDTH + 36)}px` } as CSSProperties}>
                       <ol className="commit-list">
                         {repository.commits.map((commit) => (
                           <li className={reachableCommits && !reachableCommits.has(commit.id) ? "commit-dimmed" : undefined} key={commit.id}>
@@ -619,7 +666,14 @@ function App() {
                     </div>
                   ) : <p className="muted">No commits yet.</p>}
                   {repository.has_more_commits && (
-                    <button className="button button-secondary load-more" onClick={loadMoreCommits} disabled={loadingMore}>
+                    <button
+                      className="button button-secondary load-more"
+                      onClick={() => {
+                        loadMoreFailedRef.current = false;
+                        void loadMoreCommits();
+                      }}
+                      disabled={loadingMore}
+                    >
                       {loadingMore ? "Loading…" : "Load older commits"}
                     </button>
                   )}
@@ -663,9 +717,9 @@ function App() {
                   className="button button-primary"
                   type="button"
                   onClick={() => void commitChanges()}
-                  disabled={committing || changingStatus || !commitMessage.length || (!isAmend && !repository.status.staged.length)}
+                  disabled={committing || changingStatus || !commitMessage.length || (!isAmend && !repository.status.staged.length && !repository.status.merging)}
                 >
-                  {committing ? "Committing…" : isAmend ? "Amend commit" : "Commit staged changes"}
+                  {committing ? "Committing…" : isAmend ? "Amend commit" : repository.status.merging ? "Commit merge" : "Commit staged changes"}
                 </button>
                 {commitError && <p className="error-message" role="alert">{commitError}</p>}
               </section>
@@ -700,7 +754,7 @@ function App() {
                                   type="button"
                                   aria-label={`Unstage ${entry.path}`}
                                   onClick={() => void changeStatusEntry(entry, "unstage")}
-                                  disabled={changingStatus}
+                                  disabled={changingStatus || committing}
                                 >
                                   Unstage
                                 </button>
@@ -710,7 +764,7 @@ function App() {
                                   type="button"
                                   aria-label={`${entry.kind === "conflicting" ? "Stage resolution for" : "Stage"} ${entry.path}`}
                                   onClick={() => void changeStatusEntry(entry, "stage")}
-                                  disabled={changingStatus}
+                                  disabled={changingStatus || committing}
                                 >
                                   {entry.kind === "conflicting" ? "Stage resolution" : "Stage"}
                                 </button>
@@ -799,6 +853,7 @@ function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="identity-title"
+            onKeyDown={keepFocusInDialog}
             onSubmit={(event) => {
               event.preventDefault();
               if (!identityPrompt.name.trim() || !identityPrompt.email.trim()) {

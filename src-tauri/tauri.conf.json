@@ -21,11 +21,16 @@
     ],
     "security": {
       "csp": {
-        "default-src": "'self' asset: http://asset.localhost",
+        "default-src": "'self'",
+        "script-src": "'self'",
         "connect-src": "ipc: http://ipc.localhost",
-        "img-src": "'self' asset: http://asset.localhost blob: data:",
-        "font-src": "'self' asset: http://asset.localhost",
-        "style-src": "'self'"
+        "img-src": "'self' blob: data:",
+        "font-src": "'self'",
+        "style-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
       }
     }
   },
