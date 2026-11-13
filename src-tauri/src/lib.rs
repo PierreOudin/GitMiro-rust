@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -1406,9 +1406,13 @@ fn clone_repository_to(
         .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            "Git was not found: install Git and make sure it is on the PATH".to_owned()
+        } else {
+            format!("Could not start Git: {error}")
+        }
+    })?;
     let output = match collect_output_inner(
         &mut child,
         None,
@@ -1917,6 +1921,10 @@ struct AppStateInner {
     open_root: Mutex<Option<String>>,
     /// Serializes index and COMMIT_EDITMSG writers (stage, unstage, resolve, commit, draft saves).
     mutation: Mutex<()>,
+    /// Held during a clone. Two clones racing for one new folder could both pass `validate_clone_destination` and
+    /// write into it, and the timeout cleanup of one could remove the other's files.
+    // ponytail: one clone at a time; a set of reserved destinations if parallel clones are ever needed.
+    cloning: Mutex<()>,
 }
 
 impl AppState {
@@ -1954,6 +1962,16 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn try_lock_clone(&self) -> Result<MutexGuard<'_, ()>, String> {
+        match self.0.cloning.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                Err("Another clone is in progress; wait for it to finish".to_owned())
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -1972,10 +1990,16 @@ async fn open_repository(
     .map_err(|error| format!("Could not read repository: {error}"))?
 }
 
-/// Clones into a new folder; the page then opens it with `open_repository`.
+/// Clones into a new folder; the page then opens it with `open_repository`. The open repository is not touched.
 #[tauri::command]
-async fn clone_repository(source: String, destination: String) -> Result<(), String> {
+async fn clone_repository(
+    state: tauri::State<'_, AppState>,
+    source: String,
+    destination: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _cloning = state.try_lock_clone()?;
         clone_repository_to(
             git_command(),
             &source,
@@ -3516,7 +3540,7 @@ exit 0
 mod clone_tests {
     //! GM-70: clones from throwaway repositories and from local HTTP servers, never from the network.
     use super::{
-        GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
+        AppState, GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
         validate_clone_source,
     };
     use std::{
@@ -3815,6 +3839,38 @@ mod clone_tests {
         assert!(error.contains("did not finish"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(20));
         assert!(!destination.exists(), "{error}");
+    }
+
+    #[test]
+    fn reports_a_source_folder_that_is_not_a_repository_and_leaves_no_folder() {
+        let temp = TempDir::new();
+        let source = temp.0.join("not a repository");
+        fs::create_dir(&source).unwrap();
+        let destination = temp.0.join("clone");
+
+        let error = clone_repository_to(
+            git_without_credential_helpers(),
+            source.to_str().unwrap(),
+            &destination,
+            GIT_TIMEOUT,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("does not appear to be a git repository"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn refuses_a_second_clone_while_one_is_running() {
+        let state = AppState::default();
+        let running = state.try_lock_clone().unwrap();
+
+        assert!(state.try_lock_clone().is_err());
+        drop(running);
+        assert!(state.try_lock_clone().is_ok());
     }
 
     #[test]
