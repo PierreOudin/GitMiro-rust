@@ -23,7 +23,7 @@ writeFileSync(join(noid, "a.txt"), "a\n");
 git(noid, "add", ".");
 execFileSync("git", ["-C", noid, "-c", "user.name=Seed", "-c", "user.email=seed@example.invalid", "commit", "-q", "-m", "seed"]);
 writeFileSync(join(noid, "b.txt"), "b\n");
-writeFileSync(join(noid, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f .git/fail ]; then echo "hook says no" >&2; exit 1; fi\nexit 0\n');
+writeFileSync(join(noid, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f .git/slow ]; then sleep 3; fi\nif [ -f .git/fail ]; then echo "hook says no" >&2; exit 1; fi\nexit 0\n');
 // plain: slow hook to hold a commit open.
 const plain = join(fixtures, "plain");
 writeFileSync(join(plain, ".git", "hooks", "pre-commit"), "#!/bin/sh\nsleep 3\nexit 0\n");
@@ -148,9 +148,8 @@ try {
   await focusLabel("View diff for f.txt");
   await press("Enter");
   check("Enter on Diff opens the diff view", await waitFor("document.querySelector('.file-diff-patch')"));
-  await ev("document.querySelector('.file-diff-view button').focus()");
-  await press("Escape");
-  check("Escape closes the diff view", await waitFor("!document.querySelector('.file-diff-view')", 3000));
+  await press("Escape"); // the focus is still on the Diff button, outside the diff view
+  check("Escape closes the diff view",await waitFor("!document.querySelector('.file-diff-view')", 3000));
   check("focus returns to the Diff button that opened it", (await activeLabel()) === "View diff for f.txt", await activeLabel());
   const commitCursor = await ev("const b=document.querySelector('.commit-composer .button-primary'); return b.disabled+':'+getComputedStyle(b).cursor");
   check("a disabled (not busy) button has no progress cursor", commitCursor === "true:default", commitCursor);
@@ -224,7 +223,8 @@ try {
     const where = await ev("const a=document.activeElement; return !a||a===document.body ? 'body' : document.querySelector('dialog[open]').contains(a) ? 'in' : (a.id||a.className)");
     if (where !== "in" && where !== "body") outside.push(where);
   }
-  check("Tab and Shift+Tab stay inside the dialog", outside.length === 0, outside.join(","));
+  // When it wraps, Chromium passes once through the document (<body>) before coming back into the dialog.
+  check("Tab and Shift+Tab never reach the page behind the dialog", outside.length === 0, outside.join(","));
   await press("Escape");
   check("Escape closes the identity dialog", await waitFor("!document.querySelector('dialog[open]')", 3000));
   check("focus returns to the commit button", await ev("return document.activeElement===document.querySelector('.commit-composer .button-primary')"));
@@ -239,8 +239,13 @@ try {
   await ev("document.querySelector('dialog[open] .button-primary').click()");
   check("a commit error is shown inside the identity dialog", await waitFor("document.querySelector('dialog[open] .error-message')?.textContent.includes('hook says no')"));
   rmSync(join(noid, ".git", "fail"));
+  writeFileSync(join(noid, ".git", "slow"), ""); // the hook now takes 3 s
   await ev("document.querySelector('dialog[open] .button-primary').click()");
-  check("retry from the dialog commits with the entered identity", await waitFor("!document.querySelector('dialog[open]')", 15000));
+  await waitFor("document.querySelector('.commit-composer .button-primary')?.textContent==='Committing…'");
+  for (let i = 0; i < 3; i++) await press("Escape");
+  check("Escape (pressed 3 times) does not close the dialog while its commit runs", await ev("return !!document.querySelector('dialog[open]')"));
+  rmSync(join(noid, ".git", "slow"));
+  check("retry from the dialog commits with the entered identity",await waitFor("!document.querySelector('dialog[open]')", 15000));
   check("author recorded", git(noid, "log", "-1", "--format=%an <%ae>").trim() === "Dialog Author <dialog@example.invalid>");
 
   // --- GM-69: welcome screen, failed open and removal of a recent entry with the keyboard

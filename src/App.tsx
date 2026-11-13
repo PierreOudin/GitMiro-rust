@@ -125,6 +125,11 @@ function readRecentRepositories(): string[] {
   }
 }
 
+// Stable, so React calls it only when the dialog is mounted.
+function showModal(dialog: HTMLDialogElement | null) {
+  dialog?.showModal();
+}
+
 function App() {
   const [repository, setRepository] = useState<RepositorySummary | null>(null);
   const [recentRepositories, setRecentRepositories] = useState(readRecentRepositories);
@@ -217,22 +222,36 @@ function App() {
       ?.focus();
   });
 
-  // F6 / Shift+F6 move between the reference, history (or diff) and status panes, as in Windows applications.
+  // Handled on the document so they work wherever the focus is, <body> included. Only refs and setters are used, so
+  // the functions captured by the first render stay valid.
   useEffect(() => {
-    function cyclePanes(event: globalThis.KeyboardEvent) {
-      if (event.key !== "F6") return;
-      const panes = [...document.querySelectorAll<HTMLElement>(".reference-sidebar, .history-panel, .status-column")];
-      if (!panes.length) return;
-      event.preventDefault();
-      const current = panes.findIndex((pane) => pane.contains(document.activeElement));
-      const next = current < 0
-        ? (event.shiftKey ? panes.length - 1 : 0)
-        : (current + (event.shiftKey ? -1 : 1) + panes.length) % panes.length;
-      (panes[next].querySelector<HTMLElement>(".reference-item-selected")
-        ?? panes[next].querySelector<HTMLElement>("button:not(:disabled), select, textarea:not(:disabled)"))?.focus();
+    function handleKey(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape" && document.querySelector("dialog[open]")) {
+        // Prevented here, Escape never closes the dialog natively: React state alone decides, and a commit started
+        // from the dialog cannot be stopped safely, so the dialog stays until it ends.
+        event.preventDefault();
+        if (!committingRef.current) closeIdentityPrompt();
+      } else if (event.key === "Escape" && selectedDiffRef.current) {
+        event.preventDefault();
+        backToHistory();
+      } else if (event.key === "F6") {
+        // F6 / Shift+F6 move between the reference, history (or diff) and status panes, as in Windows applications.
+        const panes = [...document.querySelectorAll<HTMLElement>(".reference-sidebar, .history-panel, .status-column")];
+        if (!panes.length) return;
+        event.preventDefault();
+        const step = event.shiftKey ? -1 : 1;
+        const current = panes.findIndex((pane) => pane.contains(document.activeElement));
+        const start = current < 0 ? (event.shiftKey ? 0 : panes.length - 1) : current;
+        for (let offset = 1; offset <= panes.length; offset++) {
+          const pane = panes[(start + step * offset + panes.length * offset) % panes.length];
+          const target = pane.querySelector<HTMLElement>(".reference-item-selected")
+            ?? pane.querySelector<HTMLElement>("button:not(:disabled), select, textarea:not(:disabled)");
+          if (target) return target.focus(); // skip a pane with nothing to focus (no references yet)
+        }
+      }
     }
-    document.addEventListener("keydown", cyclePanes);
-    return () => document.removeEventListener("keydown", cyclePanes);
+    document.addEventListener("keydown", handleKey);
+    return () => document.removeEventListener("keydown", handleKey);
   }, []);
 
   function closeIdentityPrompt() {
@@ -241,7 +260,14 @@ function App() {
     focusTargetRef.current = () => opener;
   }
 
-  // Without a path, asks for a folder first.
+  // A page still loading belongs to the history being replaced, and an earlier page failure no longer applies.
+  function resetHistoryPaging() {
+    historyRequestRef.current++;
+    loadingMoreRef.current = false;
+    loadMoreFailedRef.current = false;
+    setLoadingMore(false);
+  }
+
   async function openRepository(path?: string) {
     if (openingRef.current || committingRef.current) return;
     openingRef.current = true;
@@ -266,10 +292,7 @@ function App() {
   async function openRepositoryPath(path: string) {
     const opened = await invoke<RepositorySummary>("open_repository", { path });
     setActivity(`Opened ${opened.name} on ${opened.branch}`);
-    historyRequestRef.current++;
-    loadingMoreRef.current = false;
-    loadMoreFailedRef.current = false;
-    setLoadingMore(false);
+    resetHistoryPaging();
     setHistoryFilter("");
     statusRefreshRef.current++;
     setStatusError(null);
@@ -358,11 +381,8 @@ function App() {
       if (repositoryPathRef.current !== targetPath) return;
       setRepository(updated);
       setActivity(`${amending ? "Amended" : "Committed"} ${updated.history_head?.slice(0, 7) ?? ""} on ${updated.branch}`);
-      // The history and status were replaced: a page still loading for the old HEAD and earlier errors no longer apply.
-      historyRequestRef.current++;
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
-      loadMoreFailedRef.current = false;
+      // The history and status were replaced: earlier errors no longer apply either.
+      resetHistoryPaging();
       setError(null);
       setStatusError(null);
       setCommitMessage(updated.commit.draft);
@@ -616,16 +636,7 @@ function App() {
             </aside>
             <section className="history-panel" aria-label="Commit history">
               {selectedDiff ? (
-                <div
-                  className="file-diff-view"
-                  aria-label="File diff"
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      backToHistory();
-                    }
-                  }}
-                >
+                <div className="file-diff-view" aria-label="File diff">
                   <header className="file-diff-heading">
                     <button className="button button-secondary" onClick={backToHistory}>Back to history</button>
                     <div>
@@ -898,6 +909,7 @@ function App() {
                       <button
                         className="recent-remove"
                         aria-label={`Remove ${path} from recent repositories`}
+                        disabled={opening}
                         onClick={() => removeRecentRepository(path, index)}
                       >
                         ×
@@ -910,22 +922,8 @@ function App() {
         </section>
       )}
       {identityPrompt && (
-        // A modal <dialog>: the page behind is inert, Tab stays inside, Escape fires `cancel`.
-        <dialog
-          className="identity-dialog"
-          aria-labelledby="identity-title"
-          ref={(dialog) => {
-            if (dialog && !dialog.open) dialog.showModal();
-          }}
-          onCancel={(event) => {
-            // The commit started from the dialog cannot be stopped safely; keep the dialog until it ends.
-            if (committingRef.current) event.preventDefault();
-          }}
-          onClose={(event) => {
-            // `close` is queued: ignore it if the dialog was opened again in the meantime.
-            if (!event.currentTarget.open) closeIdentityPrompt();
-          }}
-        >
+        // A modal <dialog>: the page behind is inert and Tab never reaches it. Escape is handled with the other keys.
+        <dialog className="identity-dialog" aria-labelledby="identity-title" ref={showModal}>
           <form
             onSubmit={(event) => {
               event.preventDefault();
