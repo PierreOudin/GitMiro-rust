@@ -18,6 +18,11 @@ Git operation through the Git CLI; there is no Kotlin, Gradle or JGit code here.
 - Notion is the source of truth for Epics, Features, User Stories, tasks, dependencies, acceptance criteria and Quality
   Gates. Record commits, SHAs, test results and reviews on the Notion task; only record what was actually done.
 - Commits follow Conventional Commits and cite the Notion task ID (e.g. `Refs: GM-68`).
+- Reviews (from US4.2 / GM-36 on): exactly one Code Review (diff, risks, security, regressions) and one Ponytail
+  Review (useful simplifications, superfluous code, maintainability) per Story, preferably on the final SHA. Fix the
+  blocking findings and re-check only what changed; no extra review rounds. Record each report with its SHA.
+- Caveman (concise mode) is optional: use it in `lite` mode when it is already installed; never install it
+  automatically, and never let it cut correctness, tests, security or evidence.
 - Do not rewrite the GM-61 to GM-66 evidence (ADR-001 snapshots, `docs/perf/`); its paths and SHAs are those of
   `Isipharm/GitMiro`.
 
