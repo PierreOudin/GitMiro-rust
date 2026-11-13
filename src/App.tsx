@@ -2,7 +2,7 @@ import "./App.css";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { type CSSProperties, type KeyboardEvent, type UIEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type UIEvent, useEffect, useMemo, useRef, useState } from "react";
 import { reachableCommitIds } from "./history-filter";
 import { isNearEnd } from "./scroll";
 
@@ -148,12 +148,15 @@ function App() {
   const [identityPrompt, setIdentityPrompt] = useState<{ name: string; email: string; save: boolean } | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
   const [openGeneration, setOpenGeneration] = useState(0);
+  // What the last operation is doing or did, announced politely; errors use their own role="alert" messages.
+  const [activity, setActivity] = useState("");
   const selectedDiffRef = useRef<typeof selectedDiff>(null);
   const openingRef = useRef(false);
   const loadingMoreRef = useRef(false);
   const loadMoreFailedRef = useRef(false);
   const repositoryPathRef = useRef<string | null>(null);
   const identityOpenerRef = useRef<HTMLElement | null>(null);
+  const focusTargetRef = useRef<(() => HTMLElement | null | undefined) | null>(null);
   const changingStatusRef = useRef(false);
   const committingRef = useRef(false);
   const commitPersistTimerRef = useRef<number | null>(null);
@@ -202,51 +205,58 @@ function App() {
     if (!loadMoreFailedRef.current && isNearEnd(event.currentTarget)) void loadMoreCommits();
   }
 
-  // Escape closes the identity dialog; Tab cycles inside it (it is aria-modal).
-  function keepFocusInDialog(event: KeyboardEvent<HTMLFormElement>) {
-    if (event.key === "Escape" && !committingRef.current) {
+  // An action that disables or removes the focused control drops the focus to <body>. Once nothing is busy, move it
+  // where that action asked (the message box if that control is gone), unless the user has moved it meanwhile.
+  useEffect(() => {
+    const target = focusTargetRef.current;
+    if (!target || opening || committing || changingStatus) return;
+    focusTargetRef.current = null;
+    if (document.activeElement && document.activeElement !== document.body) return;
+    [target(), document.getElementById("commit-message")]
+      .find((element) => element?.isConnected && !element.matches(":disabled"))
+      ?.focus();
+  });
+
+  // F6 / Shift+F6 move between the reference, history (or diff) and status panes, as in Windows applications.
+  useEffect(() => {
+    function cyclePanes(event: globalThis.KeyboardEvent) {
+      if (event.key !== "F6") return;
+      const panes = [...document.querySelectorAll<HTMLElement>(".reference-sidebar, .history-panel, .status-column")];
+      if (!panes.length) return;
       event.preventDefault();
-      setIdentityPrompt(null);
-    } else if (event.key === "Tab") {
-      const items = event.currentTarget.querySelectorAll<HTMLElement>("input, button:not([disabled])");
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
+      const current = panes.findIndex((pane) => pane.contains(document.activeElement));
+      const next = current < 0
+        ? (event.shiftKey ? panes.length - 1 : 0)
+        : (current + (event.shiftKey ? -1 : 1) + panes.length) % panes.length;
+      (panes[next].querySelector<HTMLElement>(".reference-item-selected")
+        ?? panes[next].querySelector<HTMLElement>("button:not(:disabled), select, textarea:not(:disabled)"))?.focus();
     }
+    document.addEventListener("keydown", cyclePanes);
+    return () => document.removeEventListener("keydown", cyclePanes);
+  }, []);
+
+  function closeIdentityPrompt() {
+    setIdentityPrompt(null);
+    const opener = identityOpenerRef.current;
+    focusTargetRef.current = () => opener;
   }
 
-  // Inputs are disabled while committing, which drops the focus to <body>; hand it back to the message box.
-  useEffect(() => {
-    if (!committing && (document.activeElement === document.body || document.activeElement === null)) {
-      document.getElementById("commit-message")?.focus();
-    }
-  }, [committing]);
-
-  // Give the focus back to what opened the dialog once it is gone.
-  useEffect(() => {
-    if (!identityPrompt && identityOpenerRef.current) {
-      identityOpenerRef.current.focus();
-      identityOpenerRef.current = null;
-    }
-  }, [identityPrompt === null]);
-
-  async function openRepository() {
+  // Without a path, asks for a folder first.
+  async function openRepository(path?: string) {
     if (openingRef.current || committingRef.current) return;
     openingRef.current = true;
     setOpening(true);
     setError(null);
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    focusTargetRef.current = () => opener; // on success the repository title takes the focus instead
     try {
-      const path = await open({ directory: true, multiple: false });
-      if (!path || Array.isArray(path)) return;
-      await openRepositoryPath(path);
+      const chosen = path ?? await open({ directory: true, multiple: false });
+      if (!chosen || Array.isArray(chosen)) return;
+      setActivity(`Opening ${chosen}…`);
+      await openRepositoryPath(chosen);
     } catch (error) {
       setError(String(error));
+      setActivity("");
     } finally {
       openingRef.current = false;
       setOpening(false);
@@ -255,6 +265,7 @@ function App() {
 
   async function openRepositoryPath(path: string) {
     const opened = await invoke<RepositorySummary>("open_repository", { path });
+    setActivity(`Opened ${opened.name} on ${opened.branch}`);
     historyRequestRef.current++;
     loadingMoreRef.current = false;
     loadMoreFailedRef.current = false;
@@ -280,23 +291,10 @@ function App() {
     setRecentRepositories((current) => [opened.path, ...current.filter((recent) => recent !== opened.path)]);
   }
 
-  async function reopenRepository(path: string) {
-    if (openingRef.current) return;
-    openingRef.current = true;
-    setOpening(true);
-    setError(null);
-    try {
-      await openRepositoryPath(path);
-    } catch (error) {
-      setError(String(error));
-    } finally {
-      openingRef.current = false;
-      setOpening(false);
-    }
-  }
-
-  function removeRecentRepository(path: string) {
+  function removeRecentRepository(path: string, index: number) {
     setRecentRepositories((current) => current.filter((recent) => recent !== path));
+    focusTargetRef.current = () =>
+      recentRepositoryRefs.current[index] ?? recentRepositoryRefs.current[index - 1] ?? document.getElementById("recent-filter");
   }
 
   function changeCommitMessage(message: string) {
@@ -339,6 +337,8 @@ function App() {
     setCommitting(true);
     setCommitError(null);
     setIdentityError(null);
+    setActivity(amending ? "Amending the last commit…" : "Committing…");
+    focusTargetRef.current = () => document.getElementById("commit-message"); // disabled while committing
     const targetPath = repository.path;
     statusRefreshRef.current++; // a status read that started before the commit would show the old index
     if (commitPersistTimerRef.current !== null) {
@@ -357,7 +357,14 @@ function App() {
       // Opening another repository is blocked while committing; still never let a late result replace the visible one.
       if (repositoryPathRef.current !== targetPath) return;
       setRepository(updated);
-      loadMoreFailedRef.current = false; // the history was replaced; an earlier page failure no longer applies
+      setActivity(`${amending ? "Amended" : "Committed"} ${updated.history_head?.slice(0, 7) ?? ""} on ${updated.branch}`);
+      // The history and status were replaced: a page still loading for the old HEAD and earlier errors no longer apply.
+      historyRequestRef.current++;
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+      loadMoreFailedRef.current = false;
+      setError(null);
+      setStatusError(null);
       setCommitMessage(updated.commit.draft);
       setIsAmend(false);
       setIdentityPrompt(null);
@@ -370,6 +377,7 @@ function App() {
     } catch (error) {
       const message = String(error);
       setCommitError(message);
+      setActivity("");
       if (identity) {
         setIdentityError(message); // the dialog hides the composer where the error is otherwise shown
         document.getElementById("author-name")?.focus(); // Continue is about to be disabled; keep the focus in the dialog
@@ -406,6 +414,7 @@ function App() {
     loadingMoreRef.current = true;
     setLoadingMore(true);
     setError(null);
+    setActivity("Loading older commits…");
     try {
       const page = await invoke<CommitPage>("load_more_commits", {
         path: repository.path,
@@ -414,6 +423,7 @@ function App() {
         graphState: repository.graph_state,
       });
       if (requestId === historyRequestRef.current) {
+        setActivity(`Loaded ${page.commits.length} older commits`);
         setRepository((current) => current?.path === repository.path && current.history_head === repository.history_head
           ? {
             ...current,
@@ -427,6 +437,7 @@ function App() {
       if (requestId === historyRequestRef.current) {
         loadMoreFailedRef.current = true; // scrolling must not hammer Git; the button retries
         setError(String(error));
+        setActivity("");
       }
     } finally {
       if (requestId === historyRequestRef.current) {
@@ -469,6 +480,14 @@ function App() {
     setDiffLoading(false);
   }
 
+  function backToHistory() {
+    const selection = selectedDiffRef.current;
+    closeFileDiff();
+    focusTargetRef.current = () =>
+      (selection && document.getElementById(`diff-${selection.group}-${selection.pathBytes.join("-")}`))
+      ?? document.getElementById("history-branch-filter");
+  }
+
   async function changeStatusEntry(entry: StatusEntry, action: "stage" | "unstage") {
     if (!repository || changingStatusRef.current || committingRef.current) return;
     const targetPath = repository.path;
@@ -476,12 +495,21 @@ function App() {
     setChangingStatus(true);
     const requestId = ++statusRefreshRef.current;
     setStatusError(null);
+    setActivity(`${action === "stage" ? "Staging" : "Unstaging"} ${entry.path}…`);
+    // The entry leaves its list: keep the focus on the same row of that list, which now holds the next entry.
+    const group = action === "stage" ? "unstaged" : "staged";
+    const index = repository.status[group].indexOf(entry);
+    focusTargetRef.current = () => {
+      const buttons = document.querySelectorAll<HTMLElement>(`button[data-group="${group}"]`);
+      return buttons[Math.min(index, buttons.length - 1)];
+    };
     try {
       const status = await invoke<RepositoryStatus>(`${action}_status_entry`, {
         path: targetPath,
         pathBytes: entry.path_bytes,
       });
       if (requestId === statusRefreshRef.current) {
+        setActivity(`${action === "stage" ? "Staged" : "Unstaged"} ${entry.path}`);
         setRepository((current) => current?.path === targetPath ? { ...current, status } : current);
         const currentSelection = selectedDiffRef.current;
         if (currentSelection && samePathBytes(currentSelection.pathBytes, entry.path_bytes)) {
@@ -492,7 +520,10 @@ function App() {
         }
       }
     } catch (error) {
-      if (requestId === statusRefreshRef.current) setStatusError(String(error));
+      if (requestId === statusRefreshRef.current) {
+        setStatusError(String(error));
+        setActivity("");
+      }
     } finally {
       changingStatusRef.current = false;
       setChangingStatus(false);
@@ -506,6 +537,8 @@ function App() {
     setChangingStatus(true);
     const requestId = ++statusRefreshRef.current;
     setStatusError(null);
+    setActivity("Resolving the conflict…");
+    focusTargetRef.current = () => document.getElementById("commit-message"); // the Keep buttons are replaced
     try {
       const status = await invoke<RepositoryStatus>("resolve_conflict_file", {
         path: targetPath,
@@ -513,6 +546,7 @@ function App() {
         side,
       });
       if (requestId === statusRefreshRef.current) {
+        setActivity(`Conflict resolved with the ${side} side and staged`);
         setRepository((current) => current?.path === targetPath ? { ...current, status } : current);
         const currentSelection = selectedDiffRef.current;
         if (currentSelection && samePathBytes(currentSelection.pathBytes, pathBytes)) {
@@ -522,7 +556,10 @@ function App() {
         }
       }
     } catch (error) {
-      if (requestId === statusRefreshRef.current) setStatusError(String(error));
+      if (requestId === statusRefreshRef.current) {
+        setStatusError(String(error));
+        setActivity("");
+      }
     } finally {
       changingStatusRef.current = false;
       setChangingStatus(false);
@@ -533,6 +570,7 @@ function App() {
     <main className="app-shell" aria-label="GitMiro">
       <header className="titlebar" data-tauri-drag-region>
         <span className="wordmark">GitMiro</span>
+        <p className="activity" role="status">{activity}</p>
       </header>
       {repository ? (
         <section className="repository-view">
@@ -544,7 +582,7 @@ function App() {
               </div>
               <span className="branch-label">{repository.branch}</span>
             </div>
-            <button className="button button-secondary" onClick={openRepository} disabled={opening || changingStatus || committing}>
+            <button className="button button-secondary" onClick={() => void openRepository()} disabled={opening || changingStatus || committing}>
               {opening ? "Opening…" : "Open another"}
             </button>
           </header>
@@ -578,9 +616,18 @@ function App() {
             </aside>
             <section className="history-panel" aria-label="Commit history">
               {selectedDiff ? (
-                <div className="file-diff-view" aria-label="File diff">
+                <div
+                  className="file-diff-view"
+                  aria-label="File diff"
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      backToHistory();
+                    }
+                  }}
+                >
                   <header className="file-diff-heading">
-                    <button className="button button-secondary" onClick={closeFileDiff}>Back to history</button>
+                    <button className="button button-secondary" onClick={backToHistory}>Back to history</button>
                     <div>
                       <h2 title={selectedDiff.path}>{selectedDiff.path}</h2>
                       <span>{selectedDiff.group === "staged" ? "Staged changes" : "Unstaged changes"}</span>
@@ -754,6 +801,7 @@ function App() {
                               <span className={`status-kind status-${entry.kind}`}>{entry.kind}</span>
                               <code title={entry.path}>{entry.path}</code>
                               <button
+                                id={`diff-${group}-${entry.path_bytes.join("-")}`}
                                 className="status-action"
                                 type="button"
                                 aria-label={`View diff for ${entry.path}`}
@@ -763,6 +811,7 @@ function App() {
                               </button>
                               {group === "staged" ? (
                                 <button
+                                  data-group={group}
                                   className="status-action"
                                   type="button"
                                   aria-label={`Unstage ${entry.path}`}
@@ -773,6 +822,7 @@ function App() {
                                 </button>
                               ) : (
                                 <button
+                                  data-group={group}
                                   className="status-action"
                                   type="button"
                                   aria-label={`${entry.kind === "conflicting" ? "Stage resolution for" : "Stage"} ${entry.path}`}
@@ -797,7 +847,7 @@ function App() {
         <section className="welcome-panel">
           <h1>Open a repository</h1>
           <p>Choose a local Git repository to view its branch and recent commits.</p>
-          <button className="button button-primary" onClick={openRepository} disabled={opening} autoFocus={recentRepositories.length === 0}>
+          <button className="button button-primary" onClick={() => void openRepository()} disabled={opening} autoFocus={recentRepositories.length === 0}>
             {opening ? "Opening…" : "Open repository"}
           </button>
           {error && <p className="error-message" role="alert">{error}</p>}
@@ -829,7 +879,7 @@ function App() {
                       <button
                         ref={(element) => { recentRepositoryRefs.current[index] = element; }}
                         className="recent-repository"
-                        onClick={() => void reopenRepository(path)}
+                        onClick={() => void openRepository(path)}
                         disabled={opening}
                         onKeyDown={(event) => {
                           if (event.key === "ArrowDown" && index < filteredRecentRepositories.length - 1) {
@@ -848,7 +898,7 @@ function App() {
                       <button
                         className="recent-remove"
                         aria-label={`Remove ${path} from recent repositories`}
-                        onClick={() => removeRecentRepository(path)}
+                        onClick={() => removeRecentRepository(path, index)}
                       >
                         ×
                       </button>
@@ -860,13 +910,23 @@ function App() {
         </section>
       )}
       {identityPrompt && (
-        <div className="dialog-backdrop">
+        // A modal <dialog>: the page behind is inert, Tab stays inside, Escape fires `cancel`.
+        <dialog
+          className="identity-dialog"
+          aria-labelledby="identity-title"
+          ref={(dialog) => {
+            if (dialog && !dialog.open) dialog.showModal();
+          }}
+          onCancel={(event) => {
+            // The commit started from the dialog cannot be stopped safely; keep the dialog until it ends.
+            if (committingRef.current) event.preventDefault();
+          }}
+          onClose={(event) => {
+            // `close` is queued: ignore it if the dialog was opened again in the meantime.
+            if (!event.currentTarget.open) closeIdentityPrompt();
+          }}
+        >
           <form
-            className="identity-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="identity-title"
-            onKeyDown={keepFocusInDialog}
             onSubmit={(event) => {
               event.preventDefault();
               if (!identityPrompt.name.trim() || !identityPrompt.email.trim()) {
@@ -881,7 +941,7 @@ function App() {
           >
             <h2 id="identity-title">Commit author</h2>
             <label htmlFor="author-name">Name</label>
-            <input id="author-name" autoFocus value={identityPrompt.name} onChange={(event) => setIdentityPrompt({ ...identityPrompt, name: event.target.value })} />
+            <input id="author-name" value={identityPrompt.name} onChange={(event) => setIdentityPrompt({ ...identityPrompt, name: event.target.value })} />
             <label htmlFor="author-email">Email</label>
             <input id="author-email" type="email" value={identityPrompt.email} onChange={(event) => setIdentityPrompt({ ...identityPrompt, email: event.target.value })} />
             <label className="amend-option">
@@ -890,11 +950,11 @@ function App() {
             </label>
             {identityError && <p className="error-message" role="alert">{identityError}</p>}
             <footer>
-              <button className="button button-secondary" type="button" disabled={committing} onClick={() => setIdentityPrompt(null)}>Cancel</button>
+              <button className="button button-secondary" type="button" disabled={committing} onClick={closeIdentityPrompt}>Cancel</button>
               <button className="button button-primary" type="submit" disabled={committing}>Continue</button>
             </footer>
           </form>
-        </div>
+        </dialog>
       )}
     </main>
   );
