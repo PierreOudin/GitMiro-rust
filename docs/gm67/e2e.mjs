@@ -1,4 +1,5 @@
-// GM-67 end-to-end driver: launches the real GitMiro exe (WebView2) and drives it over the DevTools protocol.
+// GM-67 end-to-end driver (keyboard and feedback checks added by GM-69): launches the real GitMiro exe (WebView2)
+// and drives it over the DevTools protocol.
 // usage: node e2e.mjs <exe> <fixturesDir>
 import { spawn, execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
@@ -22,7 +23,7 @@ writeFileSync(join(noid, "a.txt"), "a\n");
 git(noid, "add", ".");
 execFileSync("git", ["-C", noid, "-c", "user.name=Seed", "-c", "user.email=seed@example.invalid", "commit", "-q", "-m", "seed"]);
 writeFileSync(join(noid, "b.txt"), "b\n");
-writeFileSync(join(noid, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f .git/fail ]; then echo "hook says no" >&2; exit 1; fi\nexit 0\n');
+writeFileSync(join(noid, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f .git/slow ]; then sleep 3; fi\nif [ -f .git/fail ]; then echo "hook says no" >&2; exit 1; fi\nexit 0\n');
 // plain: slow hook to hold a commit open.
 const plain = join(fixtures, "plain");
 writeFileSync(join(plain, ".git", "hooks", "pre-commit"), "#!/bin/sh\nsleep 3\nexit 0\n");
@@ -88,6 +89,16 @@ const waitFor = async (expression, timeout = 15000) => {
   }
   return false;
 };
+// Real key presses (GM-69). Enter needs its text to activate a button.
+const KEYS = { Enter: [13, "\r"], Escape: [27], Tab: [9], F6: [117] };
+const press = async (name, modifiers = 0) => {
+  const [vk, text] = KEYS[name];
+  await send("Input.dispatchKeyEvent", { type: "keyDown", key: name, code: name, windowsVirtualKeyCode: vk, modifiers, text });
+  await send("Input.dispatchKeyEvent", { type: "keyUp", key: name, code: name, windowsVirtualKeyCode: vk, modifiers });
+};
+const focusLabel = (label) => ev(`[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')===${JSON.stringify(label)}).focus()`);
+const activeLabel = () => ev("const a=document.activeElement; return a ? (a.getAttribute('aria-label')||a.id||a.tagName) : null");
+const statusLine = () => ev("return document.querySelector('.titlebar [role=status]')?.textContent ?? null");
 
 await send("Runtime.enable");
 await send("Log.enable");
@@ -119,10 +130,29 @@ try {
   check("open big repository", await openRecent("big"));
   check("focus moves to the repository title when it is opened", await ev("return document.activeElement===document.querySelector('.repository-heading h1')"));
   check("first page has 500 commits", await waitFor("document.querySelectorAll('.commit-list li').length===500"));
+  const opened = await statusLine();
+  check("status line (role=status) reports the opened repository", opened === "Opened big on main", opened);
   await ev("const c=document.querySelector('.commit-history'); c.scrollTop=c.scrollHeight;");
   check("scrolling the history container loads the 2nd page", await waitFor("document.querySelectorAll('.commit-list li').length===1000"));
   await ev("const c=document.querySelector('.commit-history'); c.scrollTop=c.scrollHeight;");
   check("scrolling again loads the last page (1300) and hides the button", await waitFor("document.querySelectorAll('.commit-list li').length===1300 && !document.querySelector('.load-more')"));
+
+  // --- GM-69: pane navigation, keyboard diff, disabled look
+  await ev("document.activeElement.blur()");
+  const panes = [];
+  for (const shift of [0, 0, 0, 8]) {
+    await press("F6", shift);
+    panes.push(await ev("return ['reference-sidebar','history-panel','status-column'].find(c=>document.activeElement.closest('.'+c))||'none'"));
+  }
+  check("F6 cycles references, history, status; Shift+F6 goes back", panes.join(",") === "reference-sidebar,history-panel,status-column,history-panel", panes.join(","));
+  await focusLabel("View diff for f.txt");
+  await press("Enter");
+  check("Enter on Diff opens the diff view", await waitFor("document.querySelector('.file-diff-patch')"));
+  await press("Escape"); // the focus is still on the Diff button, outside the diff view
+  check("Escape closes the diff view",await waitFor("!document.querySelector('.file-diff-view')", 3000));
+  check("focus returns to the Diff button that opened it", (await activeLabel()) === "View diff for f.txt", await activeLabel());
+  const commitCursor = await ev("const b=document.querySelector('.commit-composer .button-primary'); return b.disabled+':'+getComputedStyle(b).cursor");
+  check("a disabled (not busy) button has no progress cursor", commitCursor === "true:default", commitCursor);
 
   // --- focus is not stolen by a status refresh (stage replaces the repository object)
   await ev("document.getElementById('commit-message').focus()");
@@ -130,6 +160,13 @@ try {
   await waitFor("[...document.querySelectorAll('.status-action')].some(b=>b.getAttribute('aria-label')==='Unstage f.txt')");
   await sleep(300);
   check("a stage (state refresh) keeps the focus on the commit message", await ev("return document.activeElement?.id==='commit-message'"));
+  check("status line reports the stage", (await statusLine()) === "Staged f.txt", await statusLine());
+  // GM-69: unstaging with the keyboard removes the focused button; the focus stays in the staged list.
+  await focusLabel("Unstage f.txt");
+  await press("Enter");
+  await waitFor("[...document.querySelectorAll('.status-action')].some(b=>b.getAttribute('aria-label')==='Stage f.txt')");
+  await sleep(300);
+  check("after a keyboard unstage the focus moves to the next row of the staged list", (await activeLabel()) === "Unstage new.txt", await activeLabel());
 
   // --- merge with an empty index
   await backToWelcome();
@@ -160,7 +197,9 @@ try {
   const during = await ev("return {open:[...document.querySelectorAll('.repository-toolbar button')].every(b=>b.disabled), actions:[...document.querySelectorAll('.status-action')].filter(b=>/^(Unstage|Stage)/.test(b.getAttribute('aria-label')||'')).every(b=>b.disabled)}");
   check("while committing: Open another is disabled", during.open === true);
   check("while committing: stage/unstage buttons are disabled", during.actions === true);
+  check("while committing: the status line says so", (await statusLine()) === "Committing…", await statusLine());
   check("slow commit finishes", await waitFor("!document.querySelector('.commit-composer .button-primary')?.textContent.includes('Committing')", 20000));
+  check("status line reports the new commit", /^Committed [0-9a-f]{7} on main$/.test(await statusLine()), await statusLine());
   check("the open diff is closed once its staged file is committed (no stale diff)", await waitFor("!document.querySelector('.file-diff-view')", 5000));
   await sleep(300); const fa = await ev("const a=document.activeElement; return a ? a.tagName+'#'+a.id+'.'+a.className : null"); check("focus returns to the commit message after a commit (no drop to <body>)", fa === 'TEXTAREA#commit-message.', fa);
   check("commit landed in the plain repository", git(plain, "log", "-1", "--format=%s").trim() === "slow commit");
@@ -173,26 +212,58 @@ try {
   await ev(`const t=document.getElementById('commit-message'); t.focus(); const set=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set; set.call(t,'with identity'); t.dispatchEvent(new Event('input',{bubbles:true}));`);
   await waitFor("[...document.querySelectorAll('.button-primary')].some(b=>!b.disabled)");
   await ev("document.querySelector('.commit-composer .button-primary').focus(); document.querySelector('.commit-composer .button-primary').click()");
-  check("identity dialog opens when no author is configured", await waitFor("document.querySelector('[role=dialog]')"));
+  check("identity dialog opens when no author is configured", await waitFor("document.querySelector('dialog[open]')"));
   check("dialog takes the focus (name field)", await ev("return document.activeElement?.id==='author-name'"));
-  await send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  await send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
-  check("Escape closes the identity dialog", await waitFor("!document.querySelector('[role=dialog]')", 3000));
+  // GM-69: really modal. The page behind cannot take the focus and Tab never leaves the dialog.
+  check("dialog is modal and the page behind is inert", await ev("const d=document.querySelector('dialog[open]'); document.getElementById('commit-message').focus(); return d.matches(':modal') && document.activeElement.id!=='commit-message'"));
+  await ev("document.getElementById('author-name').focus()");
+  const outside = [];
+  for (let i = 0; i < 12; i++) {
+    await press("Tab", i >= 6 ? 8 : 0);
+    const where = await ev("const a=document.activeElement; return !a||a===document.body ? 'body' : document.querySelector('dialog[open]').contains(a) ? 'in' : (a.id||a.className)");
+    if (where !== "in" && where !== "body") outside.push(where);
+  }
+  // When it wraps, Chromium passes once through the document (<body>) before coming back into the dialog.
+  check("Tab and Shift+Tab never reach the page behind the dialog", outside.length === 0, outside.join(","));
+  await press("Escape");
+  check("Escape closes the identity dialog", await waitFor("!document.querySelector('dialog[open]')", 3000));
   check("focus returns to the commit button", await ev("return document.activeElement===document.querySelector('.commit-composer .button-primary')"));
 
   // failing hook: error must be visible inside the dialog
   writeFileSync(join(noid, ".git", "fail"), "");
   await ev("document.querySelector('.commit-composer .button-primary').click()");
-  await waitFor("document.querySelector('[role=dialog]')");
+  await waitFor("document.querySelector('dialog[open]')");
   const fill = (id, value) => ev(`const i=document.getElementById(${JSON.stringify(id)}); const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set; set.call(i,${JSON.stringify(value)}); i.dispatchEvent(new Event('input',{bubbles:true}));`);
   await fill("author-name", "Dialog Author");
   await fill("author-email", "dialog@example.invalid");
-  await ev("document.querySelector('[role=dialog] .button-primary').click()");
-  check("a commit error is shown inside the identity dialog", await waitFor("document.querySelector('[role=dialog] .error-message')?.textContent.includes('hook says no')"));
+  await ev("document.querySelector('dialog[open] .button-primary').click()");
+  check("a commit error is shown inside the identity dialog", await waitFor("document.querySelector('dialog[open] .error-message')?.textContent.includes('hook says no')"));
   rmSync(join(noid, ".git", "fail"));
-  await ev("document.querySelector('[role=dialog] .button-primary').click()");
-  check("retry from the dialog commits with the entered identity", await waitFor("!document.querySelector('[role=dialog]')", 15000));
+  writeFileSync(join(noid, ".git", "slow"), ""); // the hook now takes 3 s
+  await ev("document.querySelector('dialog[open] .button-primary').click()");
+  await waitFor("document.querySelector('.commit-composer .button-primary')?.textContent==='Committing…'");
+  for (let i = 0; i < 3; i++) await press("Escape");
+  check("Escape (pressed 3 times) does not close the dialog while its commit runs", await ev("return !!document.querySelector('dialog[open]')"));
+  rmSync(join(noid, ".git", "slow"));
+  check("retry from the dialog commits with the entered identity",await waitFor("!document.querySelector('dialog[open]')", 15000));
   check("author recorded", git(noid, "log", "-1", "--format=%an <%ae>").trim() === "Dialog Author <dialog@example.invalid>");
+
+  // --- GM-69: welcome screen, failed open and removal of a recent entry with the keyboard
+  const notRepo = join(work, "not-a-repository");
+  mkdirSync(notRepo, { recursive: true });
+  await ev(`localStorage.setItem('gitmiro.recentRepositories', ${JSON.stringify(JSON.stringify([notRepo, join(fixtures, "big")]))}); location.reload();`);
+  await sleep(500);
+  await waitFor("document.querySelectorAll('.recent-repository').length===2");
+  await ev("document.querySelector('.recent-repository').focus()");
+  await press("Enter");
+  check("a failed open shows an alert", await waitFor("document.querySelector('.welcome-panel [role=alert]')"));
+  await sleep(300);
+  check("after a failed open the focus returns to the entry that was activated", await ev("return document.activeElement===document.querySelector('.recent-repository')"));
+  check("after a failed open the status line is empty (no stale 'Opening')", (await statusLine()) === "", await statusLine());
+  await focusLabel(`Remove ${notRepo} from recent repositories`);
+  await press("Enter");
+  await sleep(300);
+  check("removing a recent entry moves the focus to the next entry", await ev("return document.querySelectorAll('.recent-repository').length===1 && document.activeElement===document.querySelector('.recent-repository')"));
 
   // --- capabilities
   const denied = await ev("try{ await window.__TAURI_INTERNALS__.invoke('plugin:window|set_title',{label:'main',value:'x'}); return 'allowed' }catch(e){ return String(e) }");
