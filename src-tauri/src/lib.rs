@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError, TryLockError,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -53,6 +53,15 @@ fn git_command() -> Command {
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000); // CREATE_NO_WINDOW
     command
+}
+
+/// The error for a `git_command()` that could not be spawned.
+fn spawn_error(error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::NotFound {
+        "Git was not found: install Git and make sure it is on the PATH".to_owned()
+    } else {
+        format!("Could not start Git: {error}")
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -365,7 +374,8 @@ fn collect_output_inner(
         });
     }
     // Poll instead of blocking in wait() so a hung Git (credential or signing prompt, stuck hook) can be killed.
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     let mut delay = Duration::from_micros(250);
     let mut killed_on_overflow = false;
     let status = loop {
@@ -387,7 +397,13 @@ fn collect_output_inner(
             }
             Ok(None) => {
                 thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_millis(2));
+                // Short commands are noticed within 2 ms; a long one (a clone) is polled 20 times a second.
+                let cap = if started.elapsed() < Duration::from_secs(1) {
+                    Duration::from_millis(2)
+                } else {
+                    Duration::from_millis(50)
+                };
+                delay = (delay * 2).min(cap);
             }
             Err(error) => {
                 kill_process_tree(child);
@@ -452,9 +468,7 @@ fn git_output(path: &Path, args: &[&str], locale: Option<&str>) -> Result<Output
     if let Some(locale) = locale {
         command.env("LC_ALL", locale);
     }
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let child = command.spawn().map_err(spawn_error)?;
     collect_output(child)
 }
 
@@ -467,9 +481,7 @@ fn git_child_with_paths(path: &Path, args: &[&str], paths: &[&OsStr]) -> Result<
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.args(paths);
-    command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))
+    command.spawn().map_err(spawn_error)
 }
 
 fn git_output_with_paths(
@@ -504,9 +516,7 @@ fn git_output_with_input(path: &Path, args: &[&str], input: &[u8]) -> Result<Out
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let mut child = command.spawn().map_err(spawn_error)?;
     collect_output_with_input(&mut child, Some(input))
 }
 
@@ -539,9 +549,7 @@ fn git_text_with_stdout_limit(
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let mut child = command.spawn().map_err(spawn_error)?;
     let (output, _) =
         collect_output_inner(&mut child, None, false, false, stdout_limit, GIT_TIMEOUT)?;
     if !output.status.success() {
@@ -751,9 +759,7 @@ fn repository_status(path: &Path) -> Result<RepositoryStatus, String> {
         .args(["status", "--porcelain=v2", "-z", "--untracked-files=all"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let child = command.spawn().map_err(spawn_error)?;
     let (output, truncated) = collect_output_with_truncated_stdout(child)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
@@ -1265,32 +1271,38 @@ fn repository_root(path: &Path) -> Result<String, String> {
     Err(error.trim().to_owned())
 }
 
-/// Clone sources: an absolute local folder, `https`, `http`, `ssh` and `file` URLs, and scp-like `[user@]host:path`.
-/// Anything else is refused before Git runs; `clone_repository_to` repeats the rule inside Git with `protocol.*`
-/// settings, which also cover redirects and remote helpers (`ext::`, which runs commands).
+/// Transports a clone may use. `validate_clone_source` checks them before Git runs and `clone_repository_to`
+/// enforces them inside Git (`protocol.*`), which also covers redirects and remote helpers (`ext::` runs commands).
+const CLONE_PROTOCOLS: [&str; 4] = ["https", "http", "ssh", "file"];
+
+/// Clone sources: an absolute local folder, `CLONE_PROTOCOLS` URLs, and scp-like `[user@]host:path`. A host starting
+/// with `-` is refused here too, whatever the Git version: ssh would read it as an option.
 fn validate_clone_source(source: &str) -> Result<(), String> {
     const INVALID: &str =
         "Enter an HTTPS or SSH repository URL, or the absolute path of a local repository";
+    // Git reads `<transport>::<address>` as a remote helper. An IPv6 literal (`[::1]`) only comes after `://`.
+    let transport_end = source
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .unwrap_or(source.len());
     if source.is_empty()
         || source.starts_with('-')
-        || source.contains("::")
+        || source[transport_end..].starts_with("::")
         || source.chars().any(char::is_control)
     {
         return Err(INVALID.to_owned());
     }
     if let Some((scheme, rest)) = source.split_once("://") {
         let authority = rest.split('/').next().unwrap_or_default();
+        let (user_info, host) = authority.rsplit_once('@').unwrap_or(("", authority));
         let scheme = scheme.to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "https" | "http" | "ssh" | "file")
-            || (authority.is_empty() && scheme != "file")
+        if !CLONE_PROTOCOLS.contains(&scheme.as_str())
+            || (host.is_empty() && scheme != "file")
+            || host.starts_with('-')
         {
             return Err(INVALID.to_owned());
         }
         // Git would store the password in the clone's .git/config and could repeat it in its messages.
-        if authority
-            .rsplit_once('@')
-            .is_some_and(|(user_info, _)| user_info.contains(':'))
-        {
+        if user_info.contains(':') {
             return Err(
                 "Remove the password or token from the URL: Git asks your credential manager for it"
                     .to_owned(),
@@ -1308,36 +1320,31 @@ fn validate_clone_source(source: &str) -> Result<(), String> {
     }
     // scp-like syntax. A one-letter host is a Windows drive (`C:repo`), a relative path Git would resolve against
     // the app's working directory.
-    match source.split_once(':') {
-        Some((host, path))
-            if !path.is_empty()
-                && !host.contains(['/', '\\'])
-                && host.rsplit('@').next().is_some_and(|name| name.len() > 1) =>
-        {
-            Ok(())
-        }
-        _ => Err(INVALID.to_owned()),
+    let Some((host, path)) = source.split_once(':') else {
+        return Err(INVALID.to_owned());
+    };
+    let name = host.rsplit_once('@').map_or(host, |(_, name)| name);
+    if !path.is_empty() && !host.contains(['/', '\\']) && name.len() > 1 && !name.starts_with('-') {
+        Ok(())
+    } else {
+        Err(INVALID.to_owned())
     }
 }
 
-/// The destination must be a new folder inside an existing one, so a clone never writes into, or removes, anything
-/// that was already there.
-fn validate_clone_destination(destination: &Path) -> Result<(), String> {
+/// Creates the destination, a new folder inside an existing one. Creating it, rather than checking that it is
+/// absent, reserves it atomically: two clones cannot share it, and a failed clone removes only a folder it is known
+/// to have created, never one that was already there.
+fn create_clone_destination(destination: &Path) -> Result<(), String> {
     if !destination.is_absolute() || destination.file_name().is_none() {
         return Err("Choose an absolute destination folder".to_owned());
     }
-    match fs::symlink_metadata(destination) {
-        Ok(_) => {
-            return Err("The destination already exists; choose a new folder name".to_owned());
+    fs::create_dir(destination).map_err(|error| match error.kind() {
+        io::ErrorKind::AlreadyExists => {
+            "The destination already exists; choose a new folder name".to_owned()
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Could not check the destination: {error}")),
-    }
-    if destination.parent().is_some_and(Path::is_dir) {
-        Ok(())
-    } else {
-        Err("The destination's parent folder does not exist".to_owned())
-    }
+        io::ErrorKind::NotFound => "The destination's parent folder does not exist".to_owned(),
+        _ => format!("Could not create the destination: {error}"),
+    })
 }
 
 /// Hides the user-info part (user name, password or token) of every URL in a Git message.
@@ -1378,65 +1385,53 @@ const CLONE_AUTH_ERRORS: [&str; 8] = [
 /// `-c` settings to it). Git's credential helpers stay active: they are how the user signs in. Terminal prompts are
 /// off (`git_command`), so a missing credential fails instead of hanging, and `timeout` stops anything else.
 fn clone_repository_to(
-    mut command: Command,
+    command: Command,
     source: &str,
     destination: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
     validate_clone_source(source)?;
-    validate_clone_destination(destination)?;
+    create_clone_destination(destination)?;
+    let result = run_clone(command, source, destination, timeout);
+    // Git empties the folder on most failures but keeps it since it already existed, and a stopped Git cleans
+    // nothing; the folder is this call's own.
+    if result.is_err() && fs::remove_dir_all(destination).is_err() && destination.exists() {
+        return result.map_err(|error| {
+            format!(
+                "{error}; remove the partial clone in {}",
+                destination.display()
+            )
+        });
+    }
+    result
+}
+
+fn run_clone(
+    mut command: Command,
+    source: &str,
+    destination: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    command.args(["-c", "protocol.allow=never"]);
+    for protocol in CLONE_PROTOCOLS {
+        command
+            .arg("-c")
+            .arg(format!("protocol.{protocol}.allow=always"));
+    }
     command
-        .args([
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.https.allow=always",
-            "-c",
-            "protocol.http.allow=always",
-            "-c",
-            "protocol.ssh.allow=always",
-            "-c",
-            "protocol.file.allow=always",
-            "clone",
-            "--quiet",
-            "--",
-        ])
+        .args(["clone", "--quiet", "--"])
         .arg(source)
         .arg(destination)
         .env("LC_ALL", "C")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            "Git was not found: install Git and make sure it is on the PATH".to_owned()
-        } else {
-            format!("Could not start Git: {error}")
-        }
-    })?;
-    let output = match collect_output_inner(
-        &mut child,
-        None,
-        false,
-        false,
-        MAX_GIT_STDOUT_BYTES,
-        timeout,
-    ) {
-        Ok((output, _)) => output,
-        Err(error) => {
-            // Git was stopped before it could remove its partial clone. The folder did not exist before the call.
-            if fs::remove_dir_all(destination).is_err() && destination.exists() {
-                return Err(format!(
-                    "{error}; remove the partial clone in {}",
-                    destination.display()
-                ));
-            }
-            return Err(error);
-        }
-    };
+    let mut child = command.spawn().map_err(spawn_error)?;
+    // Clone output is not used: too much of it (a chatty global hook) must not fail a finished clone.
+    let (output, _) =
+        collect_output_inner(&mut child, None, true, false, MAX_GIT_STDOUT_BYTES, timeout)?;
     if output.status.success() {
         return Ok(());
     }
-    // A failed clone removes its own folder.
     let detail = redact_url_credentials(String::from_utf8_lossy(&output.stderr).trim());
     if CLONE_AUTH_ERRORS.iter().any(|error| detail.contains(error)) {
         return Err(format!(
@@ -1713,9 +1708,7 @@ fn commit_changes(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Could not start Git commit: {error}"))?;
+    let mut child = command.spawn().map_err(spawn_error)?;
     let (output, _) = collect_output_inner(
         &mut child,
         Some(message.as_bytes()),
@@ -1921,10 +1914,6 @@ struct AppStateInner {
     open_root: Mutex<Option<String>>,
     /// Serializes index and COMMIT_EDITMSG writers (stage, unstage, resolve, commit, draft saves).
     mutation: Mutex<()>,
-    /// Held during a clone. Two clones racing for one new folder could both pass `validate_clone_destination` and
-    /// write into it, and the timeout cleanup of one could remove the other's files.
-    // ponytail: one clone at a time; a set of reserved destinations if parallel clones are ever needed.
-    cloning: Mutex<()>,
 }
 
 impl AppState {
@@ -1962,16 +1951,6 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
-
-    fn try_lock_clone(&self) -> Result<MutexGuard<'_, ()>, String> {
-        match self.0.cloning.try_lock() {
-            Ok(guard) => Ok(guard),
-            Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => {
-                Err("Another clone is in progress; wait for it to finish".to_owned())
-            }
-        }
-    }
 }
 
 #[tauri::command]
@@ -1990,16 +1969,11 @@ async fn open_repository(
     .map_err(|error| format!("Could not read repository: {error}"))?
 }
 
-/// Clones into a new folder; the page then opens it with `open_repository`. The open repository is not touched.
+/// Clones into a new folder; the page then opens it with `open_repository`. The open repository is not touched, and
+/// a second clone into the same folder is refused (`create_clone_destination`).
 #[tauri::command]
-async fn clone_repository(
-    state: tauri::State<'_, AppState>,
-    source: String,
-    destination: String,
-) -> Result<(), String> {
-    let state = state.inner().clone();
+async fn clone_repository(source: String, destination: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _cloning = state.try_lock_clone()?;
         clone_repository_to(
             git_command(),
             &source,
@@ -3026,8 +3000,42 @@ u UU N... 100644 100644 100644 100644 abc abc abc conflict.txt\0\
 }
 
 #[cfg(test)]
+mod test_dirs {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A fresh directory under the system temporary directory, removed on drop.
+    pub(crate) struct TempDir(pub(crate) PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gitmiro-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod regression_tests {
     //! GM-67 regression tests. Each one reproduces a defect on a throwaway repository.
+    use super::test_dirs::TempDir;
     use super::{
         AppState, ConflictSide, GIT_TIMEOUT, MAX_GIT_STDOUT_BYTES, StatusGroup, StatusKind,
         collect_output_inner, commit_changes, commit_message_metadata, commit_page, file_diff,
@@ -3038,26 +3046,21 @@ mod regression_tests {
         fs,
         path::{Path, PathBuf},
         process::{Output, Stdio},
-        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
     struct TempRepo {
         path: PathBuf,
+        _dir: TempDir,
     }
 
     impl TempRepo {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "gitmiro-gm67-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            let repo = Self { path };
+            let dir = TempDir::new("gm67");
+            let repo = Self {
+                path: dir.0.clone(),
+                _dir: dir,
+            };
             repo.git(&["init", "--quiet", "-b", "main"]);
             for (key, value) in [
                 ("user.name", "GitMiro Test"),
@@ -3116,12 +3119,6 @@ mod regression_tests {
             self.write(name, contents);
             self.git(&["add", name]);
             self.git(&["commit", "--quiet", "-m", message]);
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
         }
     }
 
@@ -3539,8 +3536,9 @@ exit 0
 #[cfg(test)]
 mod clone_tests {
     //! GM-70: clones from throwaway repositories and from local HTTP servers, never from the network.
+    use super::test_dirs::TempDir;
     use super::{
-        AppState, GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
+        GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
         validate_clone_source,
     };
     use std::{
@@ -3549,38 +3547,18 @@ mod clone_tests {
         net::TcpListener,
         path::{Path, PathBuf},
         process::Command,
-        sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::{Duration, Instant},
     };
 
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "gitmiro-gm70-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    /// The machine's credential manager would open a sign-in window for the test servers.
+    /// No credential helper or askpass program: the machine's credential manager, or the askpass an IDE terminal
+    /// exports (GIT_ASKPASS), would open a sign-in window or wait for one for the test servers.
     fn git_without_credential_helpers() -> Command {
         let mut command = git_command();
-        command.args(["-c", "credential.helper="]);
+        command
+            .args(["-c", "credential.helper=", "-c", "core.askPass="])
+            .env_remove("GIT_ASKPASS")
+            .env_remove("SSH_ASKPASS");
         command
     }
 
@@ -3654,7 +3632,7 @@ mod clone_tests {
 
     #[test]
     fn clones_a_local_bare_repository_into_a_path_with_spaces_and_unicode() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let source = bare_source(&temp);
         let destination = temp.0.join("dépôt cloné 日本");
 
@@ -3685,7 +3663,7 @@ mod clone_tests {
 
     #[test]
     fn refuses_an_occupied_destination_and_leaves_it_untouched() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let source = bare_source(&temp);
         let occupied = temp.0.join("occupied");
         fs::create_dir(&occupied).unwrap();
@@ -3716,7 +3694,7 @@ mod clone_tests {
 
     #[test]
     fn refuses_invalid_sources_and_destinations_before_running_git() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let destination = temp.0.join("clone");
         let missing = temp.0.join("missing");
         for source in [
@@ -3731,6 +3709,9 @@ mod clone_tests {
             "https:///repo.git",
             "https://example.invalid/repo.git\nfoo",
             "https://user:leaky-secret@example.invalid/repo.git",
+            "ssh://-oProxyCommand=calc/repo.git",
+            "ssh://git@-oProxyCommand=calc/repo.git",
+            "git@-oProxyCommand=calc:repo.git",
             missing.to_str().unwrap(),
         ] {
             let error = clone_repository_to(
@@ -3740,6 +3721,12 @@ mod clone_tests {
                 GIT_TIMEOUT,
             )
             .unwrap_err();
+            // The validator's own message: Git never ran.
+            assert_eq!(
+                Err(error.clone()),
+                validate_clone_source(source),
+                "{source}"
+            );
             assert!(!error.contains("leaky-secret"), "{error}");
             assert!(!destination.exists(), "{source}");
         }
@@ -3747,6 +3734,8 @@ mod clone_tests {
             "https://example.invalid/repo.git",
             "HTTP://user@example.invalid:8080/repo.git",
             "ssh://git@example.invalid:22/repo.git",
+            "ssh://git@[::1]/repo.git",
+            "https://[2001:db8::10]/team/repo.git",
             "git@example.invalid:owner/repo.git",
             "file:///srv/repo.git",
             temp.0.to_str().unwrap(),
@@ -3775,7 +3764,7 @@ mod clone_tests {
 
     #[test]
     fn reports_a_refused_authentication_without_leaking_the_url_user_info() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let port = local_server(Some(
             "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitMiro\"\r\n\
              Content-Length: 0\r\nConnection: close\r\n\r\n",
@@ -3799,7 +3788,7 @@ mod clone_tests {
 
     #[test]
     fn reports_an_unreachable_server_and_leaves_no_folder() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         // Bound, then closed again: nothing listens on that port.
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -3823,7 +3812,7 @@ mod clone_tests {
 
     #[test]
     fn stops_a_stalled_clone_and_removes_its_partial_folder() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let port = local_server(None);
         let destination = temp.0.join("clone");
         let started = Instant::now();
@@ -3843,7 +3832,7 @@ mod clone_tests {
 
     #[test]
     fn reports_a_source_folder_that_is_not_a_repository_and_leaves_no_folder() {
-        let temp = TempDir::new();
+        let temp = TempDir::new("gm70");
         let source = temp.0.join("not a repository");
         fs::create_dir(&source).unwrap();
         let destination = temp.0.join("clone");
@@ -3861,16 +3850,6 @@ mod clone_tests {
             "{error}"
         );
         assert!(!destination.exists());
-    }
-
-    #[test]
-    fn refuses_a_second_clone_while_one_is_running() {
-        let state = AppState::default();
-        let running = state.try_lock_clone().unwrap();
-
-        assert!(state.try_lock_clone().is_err());
-        drop(running);
-        assert!(state.try_lock_clone().is_ok());
     }
 
     #[test]
