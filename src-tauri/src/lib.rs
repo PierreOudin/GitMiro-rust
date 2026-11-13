@@ -26,6 +26,8 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Commits may run slow hooks or wait for a signing prompt.
 const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// A clone downloads the whole history and may wait for a credential manager window.
+const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Git command that never creates a console window (the release build uses the GUI subsystem, so each spawn would otherwise allocate a console host).
 fn git_command() -> Command {
@@ -1263,6 +1265,187 @@ fn repository_root(path: &Path) -> Result<String, String> {
     Err(error.trim().to_owned())
 }
 
+/// Clone sources: an absolute local folder, `https`, `http`, `ssh` and `file` URLs, and scp-like `[user@]host:path`.
+/// Anything else is refused before Git runs; `clone_repository_to` repeats the rule inside Git with `protocol.*`
+/// settings, which also cover redirects and remote helpers (`ext::`, which runs commands).
+fn validate_clone_source(source: &str) -> Result<(), String> {
+    const INVALID: &str =
+        "Enter an HTTPS or SSH repository URL, or the absolute path of a local repository";
+    if source.is_empty()
+        || source.starts_with('-')
+        || source.contains("::")
+        || source.chars().any(char::is_control)
+    {
+        return Err(INVALID.to_owned());
+    }
+    if let Some((scheme, rest)) = source.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "https" | "http" | "ssh" | "file")
+            || (authority.is_empty() && scheme != "file")
+        {
+            return Err(INVALID.to_owned());
+        }
+        // Git would store the password in the clone's .git/config and could repeat it in its messages.
+        if authority
+            .rsplit_once('@')
+            .is_some_and(|(user_info, _)| user_info.contains(':'))
+        {
+            return Err(
+                "Remove the password or token from the URL: Git asks your credential manager for it"
+                    .to_owned(),
+            );
+        }
+        return Ok(());
+    }
+    let local = Path::new(source);
+    if local.is_absolute() {
+        return if local.is_dir() {
+            Ok(())
+        } else {
+            Err("The local repository folder does not exist".to_owned())
+        };
+    }
+    // scp-like syntax. A one-letter host is a Windows drive (`C:repo`), a relative path Git would resolve against
+    // the app's working directory.
+    match source.split_once(':') {
+        Some((host, path))
+            if !path.is_empty()
+                && !host.contains(['/', '\\'])
+                && host.rsplit('@').next().is_some_and(|name| name.len() > 1) =>
+        {
+            Ok(())
+        }
+        _ => Err(INVALID.to_owned()),
+    }
+}
+
+/// The destination must be a new folder inside an existing one, so a clone never writes into, or removes, anything
+/// that was already there.
+fn validate_clone_destination(destination: &Path) -> Result<(), String> {
+    if !destination.is_absolute() || destination.file_name().is_none() {
+        return Err("Choose an absolute destination folder".to_owned());
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err("The destination already exists; choose a new folder name".to_owned());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not check the destination: {error}")),
+    }
+    if destination.parent().is_some_and(Path::is_dir) {
+        Ok(())
+    } else {
+        Err("The destination's parent folder does not exist".to_owned())
+    }
+}
+
+/// Hides the user-info part (user name, password or token) of every URL in a Git message.
+fn redact_url_credentials(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("://") {
+        let (before, after) = rest.split_at(index + 3);
+        redacted.push_str(before);
+        let authority_end = after
+            .find(|c: char| matches!(c, '/' | '\'' | '"') || c.is_whitespace())
+            .unwrap_or(after.len());
+        rest = match after[..authority_end].rfind('@') {
+            Some(at) => {
+                redacted.push_str("***");
+                &after[at..]
+            }
+            None => after,
+        };
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// Git messages (LC_ALL=C) that mean the server or SSH refused the credentials, or that none could be obtained.
+const CLONE_AUTH_ERRORS: [&str; 8] = [
+    "Authentication failed",
+    "could not read Username",
+    "could not read Password",
+    "terminal prompts disabled",
+    "Permission denied (publickey",
+    "Host key verification failed",
+    "returned error: 401",
+    "returned error: 403",
+];
+
+/// Clones `source` into the new folder `destination` with `command`, which is `git_command()` (tests add their own
+/// `-c` settings to it). Git's credential helpers stay active: they are how the user signs in. Terminal prompts are
+/// off (`git_command`), so a missing credential fails instead of hanging, and `timeout` stops anything else.
+fn clone_repository_to(
+    mut command: Command,
+    source: &str,
+    destination: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    validate_clone_source(source)?;
+    validate_clone_destination(destination)?;
+    command
+        .args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.http.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "--quiet",
+            "--",
+        ])
+        .arg(source)
+        .arg(destination)
+        .env("LC_ALL", "C")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let output = match collect_output_inner(
+        &mut child,
+        None,
+        false,
+        false,
+        MAX_GIT_STDOUT_BYTES,
+        timeout,
+    ) {
+        Ok((output, _)) => output,
+        Err(error) => {
+            // Git was stopped before it could remove its partial clone. The folder did not exist before the call.
+            if fs::remove_dir_all(destination).is_err() && destination.exists() {
+                return Err(format!(
+                    "{error}; remove the partial clone in {}",
+                    destination.display()
+                ));
+            }
+            return Err(error);
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+    // A failed clone removes its own folder.
+    let detail = redact_url_credentials(String::from_utf8_lossy(&output.stderr).trim());
+    if CLONE_AUTH_ERRORS.iter().any(|error| detail.contains(error)) {
+        return Err(format!(
+            "Authentication failed: set up access with your Git credential manager or SSH key, then try again\n{detail}"
+        ));
+    }
+    Err(if detail.is_empty() {
+        format!("Git clone failed with {}", output.status)
+    } else {
+        detail
+    })
+}
+
 fn git_path(path: &Path, name: &str) -> Result<PathBuf, String> {
     let output = git_text(
         path,
@@ -1721,10 +1904,11 @@ fn page_commits(mut commits: Vec<Commit>, mut graph_state: GraphState) -> Commit
     }
 }
 
-/// What the backend remembers between IPC calls. Every command except `open_repository` only acts on the
-/// repository last opened through it, so a stale or mismatched call (an old tab state, a request that outlived a
-/// repository switch) cannot touch another directory. It is not a barrier against a compromised page: that page
-/// can still call `open_repository` with any directory, which is why the CSP and capabilities stay minimal.
+/// What the backend remembers between IPC calls. Every command except `open_repository` and `clone_repository`
+/// only acts on the repository last opened through it, so a stale or mismatched call (an old tab state, a request
+/// that outlived a repository switch) cannot touch another directory. It is not a barrier against a compromised page:
+/// that page can still call `open_repository` with any directory, or clone into any new folder, which is why the CSP
+/// and capabilities stay minimal.
 #[derive(Clone, Default)]
 struct AppState(Arc<AppStateInner>);
 
@@ -1786,6 +1970,21 @@ async fn open_repository(
     })
     .await
     .map_err(|error| format!("Could not read repository: {error}"))?
+}
+
+/// Clones into a new folder; the page then opens it with `open_repository`.
+#[tauri::command]
+async fn clone_repository(source: String, destination: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        clone_repository_to(
+            git_command(),
+            &source,
+            Path::new(&destination),
+            GIT_CLONE_TIMEOUT,
+        )
+    })
+    .await
+    .map_err(|error| format!("Could not clone repository: {error}"))?
 }
 
 #[tauri::command]
@@ -1933,6 +2132,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             open_repository,
+            clone_repository,
             load_more_commits,
             refresh_repository_status,
             persist_commit_message,
@@ -3309,5 +3509,323 @@ exit 0
             started.elapsed()
         );
         assert_eq!(repo.text(&["log", "-1", "--format=%s"]), "committed");
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    //! GM-70: clones from throwaway repositories and from local HTTP servers, never from the network.
+    use super::{
+        GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
+        validate_clone_source,
+    };
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gitmiro-gm70-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The machine's credential manager would open a sign-in window for the test servers.
+    fn git_without_credential_helpers() -> Command {
+        let mut command = git_command();
+        command.args(["-c", "credential.helper="]);
+        command
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A bare repository with one commit, in a folder whose name has spaces and non-ASCII characters.
+    fn bare_source(temp: &TempDir) -> PathBuf {
+        let work = temp.0.join("work");
+        fs::create_dir(&work).unwrap();
+        git(&work, &["init", "--quiet", "-b", "main"]);
+        fs::write(work.join("file.txt"), "cloned\n").unwrap();
+        git(&work, &["add", "file.txt"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=GitMiro Test",
+                "-c",
+                "user.email=gitmiro-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "first",
+            ],
+        );
+        let bare = temp.0.join("source été 日本.git");
+        let output = git_command()
+            .args(["clone", "--quiet", "--bare", "--"])
+            .arg(&work)
+            .arg(&bare)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        bare
+    }
+
+    /// Answers every request with `response`, or holds the connection open when it is `None`.
+    fn local_server(response: Option<&'static str>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request);
+                match response {
+                    Some(response) => {
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    None => held.push(stream),
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn clones_a_local_bare_repository_into_a_path_with_spaces_and_unicode() {
+        let temp = TempDir::new();
+        let source = bare_source(&temp);
+        let destination = temp.0.join("dépôt cloné 日本");
+
+        clone_repository_to(
+            git_without_credential_helpers(),
+            source.to_str().unwrap(),
+            &destination,
+            GIT_TIMEOUT,
+        )
+        .unwrap();
+
+        // core.autocrlf may turn the line ending into CRLF on checkout.
+        assert_eq!(
+            fs::read_to_string(destination.join("file.txt"))
+                .unwrap()
+                .trim_end(),
+            "cloned"
+        );
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"]),
+            git(&source, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            PathBuf::from(git(&destination, &["remote", "get-url", "origin"])),
+            source
+        );
+    }
+
+    #[test]
+    fn refuses_an_occupied_destination_and_leaves_it_untouched() {
+        let temp = TempDir::new();
+        let source = bare_source(&temp);
+        let occupied = temp.0.join("occupied");
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("keep.txt"), "user data").unwrap();
+        let empty = temp.0.join("empty");
+        fs::create_dir(&empty).unwrap();
+        let file = temp.0.join("file");
+        fs::write(&file, "user file").unwrap();
+
+        for destination in [&occupied, &empty, &file] {
+            let error = clone_repository_to(
+                git_without_credential_helpers(),
+                source.to_str().unwrap(),
+                destination,
+                GIT_TIMEOUT,
+            )
+            .unwrap_err();
+            assert!(error.contains("already exists"), "{error}");
+        }
+
+        assert_eq!(
+            fs::read_to_string(occupied.join("keep.txt")).unwrap(),
+            "user data"
+        );
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "user file");
+    }
+
+    #[test]
+    fn refuses_invalid_sources_and_destinations_before_running_git() {
+        let temp = TempDir::new();
+        let destination = temp.0.join("clone");
+        let missing = temp.0.join("missing");
+        for source in [
+            "",
+            "-uhttps://example.invalid/repo.git",
+            "ext::sh -c touch% pwned",
+            "fd::17",
+            "relative/repo",
+            "C:repo",
+            "ftp://example.invalid/repo.git",
+            "git://example.invalid/repo.git",
+            "https:///repo.git",
+            "https://example.invalid/repo.git\nfoo",
+            "https://user:leaky-secret@example.invalid/repo.git",
+            missing.to_str().unwrap(),
+        ] {
+            let error = clone_repository_to(
+                git_without_credential_helpers(),
+                source,
+                &destination,
+                GIT_TIMEOUT,
+            )
+            .unwrap_err();
+            assert!(!error.contains("leaky-secret"), "{error}");
+            assert!(!destination.exists(), "{source}");
+        }
+        for source in [
+            "https://example.invalid/repo.git",
+            "HTTP://user@example.invalid:8080/repo.git",
+            "ssh://git@example.invalid:22/repo.git",
+            "git@example.invalid:owner/repo.git",
+            "file:///srv/repo.git",
+            temp.0.to_str().unwrap(),
+        ] {
+            assert_eq!(validate_clone_source(source), Ok(()), "{source}");
+        }
+        for destination in [
+            Path::new("relative-clone"),
+            &missing.join("clone"),
+            Path::new(""),
+        ] {
+            assert!(
+                clone_repository_to(
+                    git_without_credential_helpers(),
+                    temp.0.to_str().unwrap(),
+                    destination,
+                    GIT_TIMEOUT,
+                )
+                .is_err(),
+                "{}",
+                destination.display()
+            );
+        }
+        assert!(!Path::new("relative-clone").exists() && !missing.exists());
+    }
+
+    #[test]
+    fn reports_a_refused_authentication_without_leaking_the_url_user_info() {
+        let temp = TempDir::new();
+        let port = local_server(Some(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitMiro\"\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        ));
+        let destination = temp.0.join("clone");
+
+        let error = clone_repository_to(
+            git_without_credential_helpers(),
+            &format!("http://leaky-token@127.0.0.1:{port}/repo.git"),
+            &destination,
+            GIT_TIMEOUT,
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("Authentication failed"), "{error}");
+        assert!(!error.contains("leaky-token"), "{error}");
+        // Git's own message names the URL with its user name: it reached the page redacted.
+        assert!(error.contains("http://***@127.0.0.1"), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn reports_an_unreachable_server_and_leaves_no_folder() {
+        let temp = TempDir::new();
+        // Bound, then closed again: nothing listens on that port.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let destination = temp.0.join("clone");
+
+        let error = clone_repository_to(
+            git_without_credential_helpers(),
+            &format!("http://127.0.0.1:{port}/repo.git"),
+            &destination,
+            GIT_TIMEOUT,
+        )
+        .unwrap_err();
+
+        assert!(!error.starts_with("Authentication failed"), "{error}");
+        assert!(error.contains("unable to access"), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn stops_a_stalled_clone_and_removes_its_partial_folder() {
+        let temp = TempDir::new();
+        let port = local_server(None);
+        let destination = temp.0.join("clone");
+        let started = Instant::now();
+
+        let error = clone_repository_to(
+            git_without_credential_helpers(),
+            &format!("http://127.0.0.1:{port}/repo.git"),
+            &destination,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(!destination.exists(), "{error}");
+    }
+
+    #[test]
+    fn redacts_the_user_info_of_every_url() {
+        assert_eq!(
+            redact_url_credentials(
+                "could not read Password for 'https://user:tok@host:443': x\n\
+                 see http://other@host/path and https://host/clean"
+            ),
+            "could not read Password for 'https://***@host:443': x\n\
+             see http://***@host/path and https://host/clean"
+        );
     }
 }
