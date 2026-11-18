@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { type CSSProperties, type UIEvent, useEffect, useMemo, useRef, useState } from "react";
+import { cloneDestination, cloneFolderName } from "./clone";
 import { reachableCommitIds } from "./history-filter";
 import { isNearEnd } from "./scroll";
 
@@ -152,6 +153,9 @@ function App() {
   const [commitError, setCommitError] = useState<string | null>(null);
   const [identityPrompt, setIdentityPrompt] = useState<{ name: string; email: string; save: boolean } | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
+  const [clonePrompt, setClonePrompt] = useState<{ source: string; parent: string; folder: string } | null>(null);
+  const [cloning, setCloning] = useState(false);
+  const [cloneError, setCloneError] = useState<string | null>(null);
   const [openGeneration, setOpenGeneration] = useState(0);
   // What the last operation is doing or did, announced politely; errors use their own role="alert" messages.
   const [activity, setActivity] = useState("");
@@ -161,6 +165,8 @@ function App() {
   const loadMoreFailedRef = useRef(false);
   const repositoryPathRef = useRef<string | null>(null);
   const identityOpenerRef = useRef<HTMLElement | null>(null);
+  const cloneOpenerRef = useRef<HTMLElement | null>(null);
+  const cloningRef = useRef(false);
   const focusTargetRef = useRef<(() => HTMLElement | null | undefined) | null>(null);
   const changingStatusRef = useRef(false);
   const committingRef = useRef(false);
@@ -214,7 +220,7 @@ function App() {
   // where that action asked (the message box if that control is gone), unless the user has moved it meanwhile.
   useEffect(() => {
     const target = focusTargetRef.current;
-    if (!target || opening || committing || changingStatus) return;
+    if (!target || opening || committing || changingStatus || cloning) return;
     focusTargetRef.current = null;
     if (document.activeElement && document.activeElement !== document.body) return;
     [target(), document.getElementById("commit-message")]
@@ -226,11 +232,14 @@ function App() {
   // the functions captured by the first render stay valid.
   useEffect(() => {
     function handleKey(event: globalThis.KeyboardEvent) {
-      if (event.key === "Escape" && document.querySelector("dialog[open]")) {
-        // Prevented here, Escape never closes the dialog natively: React state alone decides, and a commit started
-        // from the dialog cannot be stopped safely, so the dialog stays until it ends.
+      const dialog = document.querySelector("dialog[open]");
+      if (event.key === "Escape" && dialog) {
+        // Prevented here, Escape never closes the dialog natively: React state alone decides, and a commit or clone
+        // started from a dialog cannot be stopped safely, so the dialog stays until it ends.
         event.preventDefault();
-        if (!committingRef.current) closeIdentityPrompt();
+        if (dialog.id === "clone-dialog") {
+          if (!cloningRef.current) closeClonePrompt();
+        } else if (!committingRef.current) closeIdentityPrompt();
       } else if (event.key === "Escape" && selectedDiffRef.current) {
         event.preventDefault();
         backToHistory();
@@ -268,12 +277,62 @@ function App() {
     setLoadingMore(false);
   }
 
-  async function openRepository(path?: string) {
+  function openClonePrompt() {
+    cloneOpenerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setCloneError(null);
+    setClonePrompt({ source: "", parent: "", folder: "" });
+  }
+
+  function closeClonePrompt() {
+    setClonePrompt(null);
+    const opener = cloneOpenerRef.current;
+    focusTargetRef.current = () => opener;
+  }
+
+  async function chooseCloneParent() {
+    try {
+      const parent = await open({ directory: true, multiple: false });
+      if (typeof parent === "string") setClonePrompt((current) => current && { ...current, parent });
+    } catch (error) {
+      setCloneError(String(error));
+    }
+  }
+
+  async function cloneRepository() {
+    if (!clonePrompt || cloningRef.current) return;
+    const source = clonePrompt.source.trim();
+    const destination = cloneDestination(clonePrompt.parent, clonePrompt.folder);
+    if (!source || !destination) {
+      setCloneError(!source ? "Enter a repository URL or path." : !clonePrompt.parent.trim()
+        ? "Choose the folder to clone into." : "Enter a single folder name.");
+      return;
+    }
+    cloningRef.current = true;
+    setCloning(true);
+    setCloneError(null);
+    focusTargetRef.current = () => document.getElementById("clone-source"); // the inputs are disabled while cloning
+    try {
+      await invoke("clone_repository", { source, destination });
+    } catch (error) {
+      setCloneError(String(error));
+      return;
+    } finally {
+      cloningRef.current = false;
+      setCloning(false);
+    }
+    setClonePrompt(null);
+    // The clone is kept even if opening it fails; that error shows like any other open error.
+    await openRepository(destination, cloneOpenerRef.current);
+  }
+
+  async function openRepository(
+    path?: string,
+    opener = document.activeElement instanceof HTMLElement ? document.activeElement : null,
+  ) {
     if (openingRef.current || committingRef.current) return;
     openingRef.current = true;
     setOpening(true);
     setError(null);
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     focusTargetRef.current = () => opener; // on success the repository title takes the focus instead
     try {
       const chosen = path ?? await open({ directory: true, multiple: false });
@@ -602,9 +661,14 @@ function App() {
               </div>
               <span className="branch-label">{repository.branch}</span>
             </div>
-            <button className="button button-secondary" onClick={() => void openRepository()} disabled={opening || changingStatus || committing}>
-              {opening ? "Opening…" : "Open another"}
-            </button>
+            <div className="actions">
+              <button className="button button-secondary" onClick={openClonePrompt} disabled={opening || changingStatus || committing}>
+                Clone
+              </button>
+              <button className="button button-secondary" onClick={() => void openRepository()} disabled={opening || changingStatus || committing}>
+                {opening ? "Opening…" : "Open another"}
+              </button>
+            </div>
           </header>
           {error && <p className="error-message repository-error" role="alert">{error}</p>}
           <div className="repository-layout">
@@ -857,10 +921,15 @@ function App() {
       ) : (
         <section className="welcome-panel">
           <h1>Open a repository</h1>
-          <p>Choose a local Git repository to view its branch and recent commits.</p>
-          <button className="button button-primary" onClick={() => void openRepository()} disabled={opening} autoFocus={recentRepositories.length === 0}>
-            {opening ? "Opening…" : "Open repository"}
-          </button>
+          <p>Choose a local Git repository, or clone one, to view its branch and recent commits.</p>
+          <div className="actions">
+            <button className="button button-primary" onClick={() => void openRepository()} disabled={opening} autoFocus={recentRepositories.length === 0}>
+              {opening ? "Opening…" : "Open repository"}
+            </button>
+            <button className="button button-secondary" onClick={openClonePrompt} disabled={opening}>
+              Clone repository
+            </button>
+          </div>
           {error && <p className="error-message" role="alert">{error}</p>}
           <section className="recent-repositories" aria-label="Recent repositories">
             <label htmlFor="recent-filter">Recent</label>
@@ -923,7 +992,7 @@ function App() {
       )}
       {identityPrompt && (
         // A modal <dialog>: the page behind is inert and Tab never reaches it. Escape is handled with the other keys.
-        <dialog className="identity-dialog" aria-labelledby="identity-title" ref={showModal}>
+        <dialog className="dialog" aria-labelledby="identity-title" ref={showModal}>
           <form
             onSubmit={(event) => {
               event.preventDefault();
@@ -950,6 +1019,68 @@ function App() {
             <footer>
               <button className="button button-secondary" type="button" disabled={committing} onClick={closeIdentityPrompt}>Cancel</button>
               <button className="button button-primary" type="submit" disabled={committing}>Continue</button>
+            </footer>
+          </form>
+        </dialog>
+      )}
+      {clonePrompt && (
+        <dialog id="clone-dialog" className="dialog" aria-labelledby="clone-title" ref={showModal}>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void cloneRepository();
+            }}
+          >
+            <h2 id="clone-title">Clone a repository</h2>
+            <label htmlFor="clone-source">Repository URL or path</label>
+            <input
+              id="clone-source"
+              value={clonePrompt.source}
+              placeholder="https://host/owner/repository.git"
+              disabled={cloning}
+              spellCheck={false}
+              onChange={(event) => {
+                const source = event.target.value;
+                setCloneError(null);
+                // The folder follows the source until the user types a name of their own.
+                const following = !clonePrompt.folder || clonePrompt.folder === cloneFolderName(clonePrompt.source);
+                const folder = following ? cloneFolderName(source) : clonePrompt.folder;
+                setClonePrompt({ ...clonePrompt, source, folder });
+              }}
+            />
+            <label htmlFor="clone-parent">Clone into</label>
+            <div className="clone-parent">
+              <input
+                id="clone-parent"
+                value={clonePrompt.parent}
+                disabled={cloning}
+                spellCheck={false}
+                onChange={(event) => {
+                  setCloneError(null);
+                  setClonePrompt({ ...clonePrompt, parent: event.target.value });
+                }}
+              />
+              <button className="button button-secondary" type="button" disabled={cloning} onClick={() => void chooseCloneParent()}>
+                Browse…
+              </button>
+            </div>
+            <label htmlFor="clone-folder">Folder name</label>
+            <input
+              id="clone-folder"
+              value={clonePrompt.folder}
+              disabled={cloning}
+              spellCheck={false}
+              onChange={(event) => {
+                setCloneError(null);
+                setClonePrompt({ ...clonePrompt, folder: event.target.value });
+              }}
+            />
+            {cloneError && <p className="error-message" role="alert">{cloneError}</p>}
+            <footer>
+              {/* Inside the dialog, since the titlebar status is inert behind it; always rendered so the change is announced. */}
+              <p className="clone-progress" role="status">{cloning ? "Cloning, this can take a while…" : ""}</p>
+              <button className="button button-secondary" type="button" disabled={cloning} onClick={closeClonePrompt}>Cancel</button>
+              <button className="button button-primary" type="submit" disabled={cloning}>{cloning ? "Cloning…" : "Clone"}</button>
             </footer>
           </form>
         </dialog>
