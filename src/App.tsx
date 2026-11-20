@@ -216,6 +216,12 @@ function App() {
     if (!loadMoreFailedRef.current && isNearEnd(event.currentTarget)) void loadMoreCommits();
   }
 
+  // A clone error takes the focus: that announces it (a live region as well would read it twice), and a held Enter
+  // cannot resubmit the form from there.
+  useEffect(() => {
+    if (cloneError) document.getElementById("clone-error")?.focus();
+  }, [cloneError]);
+
   // An action that disables or removes the focused control drops the focus to <body>. Once nothing is busy, move it
   // where that action asked (the message box if that control is gone), unless the user has moved it meanwhile.
   useEffect(() => {
@@ -309,7 +315,7 @@ function App() {
     setCloning(true);
     setCloneError(null);
     // The inputs are disabled while cloning: the focus waits on the progress message (a held Enter must not reach
-    // Cancel), Tab leads to Cancel, and the source field takes the focus back if it was lost.
+    // Cancel), Tab leads to Cancel, and an error takes the focus (see the clone error effect).
     document.getElementById("clone-progress")?.focus();
     focusTargetRef.current = () => document.getElementById("clone-source");
     try {
@@ -1076,7 +1082,7 @@ function App() {
                 setClonePrompt({ ...clonePrompt, folder: event.target.value });
               }}
             />
-            {cloneError && <p className="error-message" role="alert">{cloneError}</p>}
+            {cloneError && <p id="clone-error" className="error-message" tabIndex={-1}>{cloneError}</p>}
             <footer>
               {/* Inside the dialog, since the titlebar status is inert behind it; always rendered so the change is announced. */}
               <p id="clone-progress" className="clone-progress" role="status" tabIndex={-1}>
