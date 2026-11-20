@@ -26,8 +26,9 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(3);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Commits may run slow hooks or wait for a signing prompt.
 const GIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
-/// A clone downloads the whole history and may wait for a credential manager window.
-const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// A clone has no overall time limit (a large repository over a slow link takes what it takes); the user can cancel
+/// it. An HTTP transfer that receives nothing for this long is abandoned by Git itself (`http.lowSpeedTime`).
+const GIT_CLONE_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Git command that never creates a console window (the release build uses the GUI subsystem, so each spawn would otherwise allocate a console host).
 fn git_command() -> Command {
@@ -52,6 +53,9 @@ fn git_command() -> Command {
     command.stdin(Stdio::null()); // callers that feed Git override this with a pipe
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000); // CREATE_NO_WINDOW
+    // Its own process group, so kill_process_tree can stop the processes Git starts along with it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command
 }
 
@@ -300,10 +304,19 @@ fn collect_output_capped_and_killing_on_truncation(child: Child) -> Result<(Outp
     )
 }
 
-/// Stops Git and, on Windows, the processes it started (a hook, a filter, a signing program): `Child::kill` alone
-/// leaves them running. The kill is forced, so Git cannot clean up after itself: a timed-out write command can leave
-/// `.git/index.lock` behind, and the next write then fails until that file is removed. Elsewhere only Git is killed.
+/// Stops Git and the processes it started (a hook, a filter, a signing program, a clone's transport and index-pack):
+/// `Child::kill` alone leaves them running. The kill is forced, so Git cannot clean up after itself: a timed-out write
+/// command can leave `.git/index.lock` behind, and the next write then fails until that file is removed. Outside
+/// Windows the whole process group `git_command` created is killed; a process that left that group survives.
 fn kill_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     #[cfg(windows)]
     {
         let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:/Windows".into());
@@ -347,6 +360,34 @@ fn collect_output_inner(
     stdout_limit: usize,
     timeout: Duration,
 ) -> Result<(Output, bool), String> {
+    collect_output_until(
+        child,
+        input,
+        allow_truncated_stdout,
+        kill_on_truncated_stdout,
+        stdout_limit,
+        Stop::After(timeout),
+    )
+}
+
+/// When `collect_output_until` stops a Git that is still running.
+enum Stop<'a> {
+    After(Duration),
+    /// No time limit: only when the flag is set (a clone the user cancels).
+    WhenSet(&'a AtomicBool),
+}
+
+/// The error `collect_output_until` returns for a Git stopped through `Stop::WhenSet`.
+const CANCELLED: &str = "Cancelled";
+
+fn collect_output_until(
+    child: &mut Child,
+    input: Option<&[u8]>,
+    allow_truncated_stdout: bool,
+    kill_on_truncated_stdout: bool,
+    stdout_limit: usize,
+    stop: Stop,
+) -> Result<(Output, bool), String> {
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout_overflow = Arc::new(AtomicBool::new(false));
@@ -375,7 +416,6 @@ fn collect_output_inner(
     }
     // Poll instead of blocking in wait() so a hung Git (credential or signing prompt, stuck hook) can be killed.
     let started = Instant::now();
-    let deadline = started + timeout;
     let mut delay = Duration::from_micros(250);
     let mut killed_on_overflow = false;
     let status = loop {
@@ -383,25 +423,32 @@ fn collect_output_inner(
             killed_on_overflow = true;
             kill_process_tree(child);
         }
+        let stopped = match stop {
+            Stop::After(timeout) if started.elapsed() >= timeout => Some(format!(
+                "Git did not finish within {} seconds and was stopped",
+                timeout.as_secs()
+            )),
+            Stop::WhenSet(flag) if flag.load(Ordering::Relaxed) => Some(CANCELLED.to_owned()),
+            _ => None,
+        };
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                kill_process_tree(child);
-                let _ = child.wait();
-                // The readers and the writer are left to finish on their own: a process that escaped the kill
-                // may still hold the pipes.
-                return Err(format!(
-                    "Git did not finish within {} seconds and was stopped",
-                    timeout.as_secs()
-                ));
-            }
             Ok(None) => {
+                if let Some(error) = stopped {
+                    kill_process_tree(child);
+                    let _ = child.wait();
+                    // The readers and the writer are left to finish on their own: a process that escaped the kill
+                    // may still hold the pipes.
+                    return Err(error);
+                }
                 thread::sleep(delay);
-                // Short commands are noticed within 2 ms; a long one (a clone) is polled 20 times a second.
-                let cap = if started.elapsed() < Duration::from_secs(1) {
-                    Duration::from_millis(2)
-                } else {
-                    Duration::from_millis(50)
+                // Commands are noticed within 2 ms; one without a time limit (a clone) is polled 20 times a second
+                // once it has run for a second.
+                let cap = match stop {
+                    Stop::WhenSet(_) if started.elapsed() >= Duration::from_secs(1) => {
+                        Duration::from_millis(50)
+                    }
+                    _ => Duration::from_millis(2),
                 };
                 delay = (delay * 2).min(cap);
             }
@@ -1271,12 +1318,20 @@ fn repository_root(path: &Path) -> Result<String, String> {
     Err(error.trim().to_owned())
 }
 
-/// Transports a clone may use. `validate_clone_source` checks them before Git runs and `clone_repository_to`
-/// enforces them inside Git (`protocol.*`), which also covers redirects and remote helpers (`ext::` runs commands).
+/// Transports a clone may use. `validate_clone_source` checks them before Git runs and `run_clone` enforces them
+/// inside Git (`GIT_ALLOW_PROTOCOL`), which also covers redirects and remote helpers (`ext::` runs commands).
 const CLONE_PROTOCOLS: [&str; 4] = ["https", "http", "ssh", "file"];
 
-/// Clone sources: an absolute local folder, `CLONE_PROTOCOLS` URLs, and scp-like `[user@]host:path`. A host starting
-/// with `-` is refused here too, whatever the Git version: ssh would read it as an option.
+/// Whether ssh would read `part` (a URL user or host, which Git percent-decodes) as an option.
+fn looks_like_option(part: &str) -> bool {
+    part.starts_with('-')
+        || part
+            .get(..3)
+            .is_some_and(|start| start.eq_ignore_ascii_case("%2d"))
+}
+
+/// Clone sources: an absolute local folder, `CLONE_PROTOCOLS` URLs, and scp-like `[user@]host:path`. A user or host
+/// starting with `-` is refused here too, whatever the Git version: ssh would read `user@host` as an option.
 fn validate_clone_source(source: &str) -> Result<(), String> {
     const INVALID: &str =
         "Enter an HTTPS or SSH repository URL, or the absolute path of a local repository";
@@ -1297,7 +1352,8 @@ fn validate_clone_source(source: &str) -> Result<(), String> {
         let scheme = scheme.to_ascii_lowercase();
         if !CLONE_PROTOCOLS.contains(&scheme.as_str())
             || (host.is_empty() && scheme != "file")
-            || host.starts_with('-')
+            || looks_like_option(host)
+            || looks_like_option(user_info)
         {
             return Err(INVALID.to_owned());
         }
@@ -1324,7 +1380,8 @@ fn validate_clone_source(source: &str) -> Result<(), String> {
         return Err(INVALID.to_owned());
     };
     let name = host.rsplit_once('@').map_or(host, |(_, name)| name);
-    if !path.is_empty() && !host.contains(['/', '\\']) && name.len() > 1 && !name.starts_with('-') {
+    if !path.is_empty() && !host.contains(['/', '\\']) && name.len() > 1 && !looks_like_option(name)
+    {
         Ok(())
     } else {
         Err(INVALID.to_owned())
@@ -1383,52 +1440,94 @@ const CLONE_AUTH_ERRORS: [&str; 8] = [
 
 /// Clones `source` into the new folder `destination` with `command`, which is `git_command()` (tests add their own
 /// `-c` settings to it). Git's credential helpers stay active: they are how the user signs in. Terminal prompts are
-/// off (`git_command`), so a missing credential fails instead of hanging, and `timeout` stops anything else.
+/// off (`git_command`), so a missing credential fails instead of hanging; an HTTP transfer that stalls for
+/// `stall_timeout` fails, and setting `cancel` stops anything else.
 fn clone_repository_to(
     command: Command,
     source: &str,
     destination: &Path,
-    timeout: Duration,
+    stall_timeout: Duration,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     validate_clone_source(source)?;
     create_clone_destination(destination)?;
-    let result = run_clone(command, source, destination, timeout);
-    // Git empties the folder on most failures but keeps it since it already existed, and a stopped Git cleans
-    // nothing; the folder is this call's own.
-    if result.is_err() && fs::remove_dir_all(destination).is_err() && destination.exists() {
-        return result.map_err(|error| {
+    let Err(error) = run_clone(command, source, destination, stall_timeout, cancel) else {
+        return Ok(());
+    };
+    if error == CANCELLED {
+        let _ = fs::remove_dir_all(destination);
+        return Err(if destination.exists() {
             format!(
-                "{error}; remove the partial clone in {}",
+                "Clone cancelled; remove the partial clone in {}",
                 destination.display()
             )
+        } else {
+            "Clone cancelled".to_owned()
         });
     }
-    result
+    // Git keeps a clone whose history arrived but whose checkout failed (a path Windows refuses, a failing
+    // post-checkout hook), and removes the others; this is the only case where its HEAD still names a commit.
+    if has_head_commit(destination) {
+        return Err(format!(
+            "The repository was downloaded into {}, but Git could not check out its files; the folder was kept\n{error}",
+            destination.display()
+        ));
+    }
+    // Git empties the folder on the other failures but keeps it since it already existed; the folder is this call's
+    // own.
+    if fs::remove_dir_all(destination).is_err() && destination.exists() {
+        return Err(format!(
+            "{error}; remove the partial clone in {}",
+            destination.display()
+        ));
+    }
+    Err(error)
+}
+
+/// Whether `destination/.git` is a repository whose HEAD is a commit. The Git directory is named, never searched
+/// for: a destination inside another repository must not find that one.
+fn has_head_commit(destination: &Path) -> bool {
+    git_command()
+        .arg("--git-dir")
+        .arg(destination.join(".git"))
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn run_clone(
     mut command: Command,
     source: &str,
     destination: &Path,
-    timeout: Duration,
+    stall_timeout: Duration,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
-    command.args(["-c", "protocol.allow=never"]);
-    for protocol in CLONE_PROTOCOLS {
-        command
-            .arg("-c")
-            .arg(format!("protocol.{protocol}.allow=always"));
-    }
     command
         .args(["clone", "--quiet", "--"])
         .arg(source)
         .arg(destination)
         .env("LC_ALL", "C")
+        // Unlike `-c protocol.allow=never`, this also overrides a protocol.<name>.allow in the user's own config.
+        .env("GIT_ALLOW_PROTOCOL", CLONE_PROTOCOLS.join(":"))
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
+        .env(
+            "GIT_HTTP_LOW_SPEED_TIME",
+            stall_timeout.as_secs().to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(spawn_error)?;
     // Clone output is not used: too much of it (a chatty global hook) must not fail a finished clone.
-    let (output, _) =
-        collect_output_inner(&mut child, None, true, false, MAX_GIT_STDOUT_BYTES, timeout)?;
+    let (output, _) = collect_output_until(
+        &mut child,
+        None,
+        true,
+        false,
+        MAX_GIT_STDOUT_BYTES,
+        Stop::WhenSet(cancel),
+    )?;
     if output.status.success() {
         return Ok(());
     }
@@ -1708,7 +1807,9 @@ fn commit_changes(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(spawn_error)?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Could not commit: {}", spawn_error(error)))?;
     let (output, _) = collect_output_inner(
         &mut child,
         Some(message.as_bytes()),
@@ -1914,6 +2015,8 @@ struct AppStateInner {
     open_root: Mutex<Option<String>>,
     /// Serializes index and COMMIT_EDITMSG writers (stage, unstage, resolve, commit, draft saves).
     mutation: Mutex<()>,
+    /// The cancel flag of the clone in progress, if any.
+    clone_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl AppState {
@@ -1945,6 +2048,13 @@ impl AppState {
         }
     }
 
+    fn clone_cancel(&self) -> MutexGuard<'_, Option<Arc<AtomicBool>>> {
+        self.0
+            .clone_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn lock_mutations(&self) -> MutexGuard<'_, ()> {
         self.0
             .mutation
@@ -1972,17 +2082,43 @@ async fn open_repository(
 /// Clones into a new folder; the page then opens it with `open_repository`. The open repository is not touched, and
 /// a second clone into the same folder is refused (`create_clone_destination`).
 #[tauri::command]
-async fn clone_repository(source: String, destination: String) -> Result<(), String> {
+async fn clone_repository(
+    state: tauri::State<'_, AppState>,
+    source: String,
+    destination: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    // ponytail: one slot, so `cancel_clone` stops the latest clone; the page runs one clone at a time.
+    *state.clone_cancel() = Some(Arc::clone(&cancel));
     tauri::async_runtime::spawn_blocking(move || {
-        clone_repository_to(
+        let result = clone_repository_to(
             git_command(),
             &source,
             Path::new(&destination),
-            GIT_CLONE_TIMEOUT,
-        )
+            GIT_CLONE_STALL_TIMEOUT,
+            &cancel,
+        );
+        // A cancel that arrives after the clone ended must not reach the next one.
+        let mut slot = state.clone_cancel();
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+        {
+            *slot = None;
+        }
+        result
     })
     .await
     .map_err(|error| format!("Could not clone repository: {error}"))?
+}
+
+/// Stops the clone in progress; its partial folder is removed. Does nothing when no clone runs.
+#[tauri::command]
+fn cancel_clone(state: tauri::State<'_, AppState>) {
+    if let Some(cancel) = state.clone_cancel().as_ref() {
+        cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 #[tauri::command]
@@ -2131,6 +2267,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_repository,
             clone_repository,
+            cancel_clone,
             load_more_commits,
             refresh_repository_status,
             persist_commit_message,
@@ -3049,13 +3186,30 @@ mod regression_tests {
         time::Duration,
     };
 
-    struct TempRepo {
-        path: PathBuf,
+    /// Runs Git in `dir` and requires it to succeed.
+    pub(super) fn git_in(dir: &Path, args: &[&str]) -> Output {
+        let output = git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    pub(super) struct TempRepo {
+        pub(super) path: PathBuf,
         _dir: TempDir,
     }
 
     impl TempRepo {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let dir = TempDir::new("gm67");
             let repo = Self {
                 path: dir.0.clone(),
@@ -3082,15 +3236,8 @@ mod regression_tests {
                 .unwrap()
         }
 
-        fn git(&self, args: &[&str]) -> Output {
-            let output = self.run(args);
-            assert!(
-                output.status.success(),
-                "git {args:?}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            output
+        pub(super) fn git(&self, args: &[&str]) -> Output {
+            git_in(&self.path, args)
         }
 
         fn text(&self, args: &[&str]) -> String {
@@ -3100,7 +3247,7 @@ mod regression_tests {
                 .to_owned()
         }
 
-        fn write(&self, name: &str, contents: &str) {
+        pub(super) fn write(&self, name: &str, contents: &str) {
             fs::write(self.path.join(name), contents).unwrap();
         }
 
@@ -3535,11 +3682,12 @@ exit 0
 
 #[cfg(test)]
 mod clone_tests {
-    //! GM-70: clones from throwaway repositories and from local HTTP servers, never from the network.
+    //! GM-70 and GM-71: clones from throwaway repositories and from local HTTP servers, never from the network.
+    use super::regression_tests::{TempRepo, git_in};
     use super::test_dirs::TempDir;
     use super::{
-        GIT_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
-        validate_clone_source,
+        GIT_CLONE_STALL_TIMEOUT, clone_repository_to, git_command, redact_url_credentials,
+        run_clone, validate_clone_source,
     };
     use std::{
         fs,
@@ -3547,6 +3695,10 @@ mod clone_tests {
         net::TcpListener,
         path::{Path, PathBuf},
         process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -3562,51 +3714,41 @@ mod clone_tests {
         command
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = git_command()
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    fn clone(source: &str, destination: &Path) -> Result<(), String> {
+        clone_repository_to(
+            git_without_credential_helpers(),
+            source,
+            destination,
+            GIT_CLONE_STALL_TIMEOUT,
+            &AtomicBool::new(false),
+        )
+    }
+
+    fn head(dir: &Path) -> String {
+        String::from_utf8(git_in(dir, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned()
     }
 
     /// A bare repository with one commit, in a folder whose name has spaces and non-ASCII characters.
     fn bare_source(temp: &TempDir) -> PathBuf {
-        let work = temp.0.join("work");
-        fs::create_dir(&work).unwrap();
-        git(&work, &["init", "--quiet", "-b", "main"]);
-        fs::write(work.join("file.txt"), "cloned\n").unwrap();
-        git(&work, &["add", "file.txt"]);
-        git(
-            &work,
+        let work = TempRepo::new();
+        work.write("file.txt", "cloned\n");
+        work.git(&["add", "file.txt"]);
+        work.git(&["commit", "--quiet", "-m", "first"]);
+        let bare = temp.0.join("source été 日本.git");
+        git_in(
+            &temp.0,
             &[
-                "-c",
-                "user.name=GitMiro Test",
-                "-c",
-                "user.email=gitmiro-test@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
+                "clone",
                 "--quiet",
-                "-m",
-                "first",
+                "--bare",
+                "--",
+                work.path.to_str().unwrap(),
+                bare.to_str().unwrap(),
             ],
         );
-        let bare = temp.0.join("source été 日本.git");
-        let output = git_command()
-            .args(["clone", "--quiet", "--bare", "--"])
-            .arg(&work)
-            .arg(&bare)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
         bare
     }
 
@@ -3636,13 +3778,7 @@ mod clone_tests {
         let source = bare_source(&temp);
         let destination = temp.0.join("dépôt cloné 日本");
 
-        clone_repository_to(
-            git_without_credential_helpers(),
-            source.to_str().unwrap(),
-            &destination,
-            GIT_TIMEOUT,
-        )
-        .unwrap();
+        clone(source.to_str().unwrap(), &destination).unwrap();
 
         // core.autocrlf may turn the line ending into CRLF on checkout.
         assert_eq!(
@@ -3651,12 +3787,10 @@ mod clone_tests {
                 .trim_end(),
             "cloned"
         );
+        assert_eq!(head(&destination), head(&source));
+        let origin = git_in(&destination, &["remote", "get-url", "origin"]).stdout;
         assert_eq!(
-            git(&destination, &["rev-parse", "HEAD"]),
-            git(&source, &["rev-parse", "HEAD"])
-        );
-        assert_eq!(
-            PathBuf::from(git(&destination, &["remote", "get-url", "origin"])),
+            PathBuf::from(String::from_utf8(origin).unwrap().trim()),
             source
         );
     }
@@ -3674,13 +3808,7 @@ mod clone_tests {
         fs::write(&file, "user file").unwrap();
 
         for destination in [&occupied, &empty, &file] {
-            let error = clone_repository_to(
-                git_without_credential_helpers(),
-                source.to_str().unwrap(),
-                destination,
-                GIT_TIMEOUT,
-            )
-            .unwrap_err();
+            let error = clone(source.to_str().unwrap(), destination).unwrap_err();
             assert!(error.contains("already exists"), "{error}");
         }
 
@@ -3711,16 +3839,13 @@ mod clone_tests {
             "https://user:leaky-secret@example.invalid/repo.git",
             "ssh://-oProxyCommand=calc/repo.git",
             "ssh://git@-oProxyCommand=calc/repo.git",
+            "ssh://-oProxyCommand=calc@example.invalid/repo.git",
+            "ssh://%2DoProxyCommand=calc@example.invalid/repo.git",
+            "ssh://git@%2doProxyCommand=calc/repo.git",
             "git@-oProxyCommand=calc:repo.git",
             missing.to_str().unwrap(),
         ] {
-            let error = clone_repository_to(
-                git_without_credential_helpers(),
-                source,
-                &destination,
-                GIT_TIMEOUT,
-            )
-            .unwrap_err();
+            let error = clone(source, &destination).unwrap_err();
             // The validator's own message: Git never ran.
             assert_eq!(
                 Err(error.clone()),
@@ -3748,18 +3873,39 @@ mod clone_tests {
             Path::new(""),
         ] {
             assert!(
-                clone_repository_to(
-                    git_without_credential_helpers(),
-                    temp.0.to_str().unwrap(),
-                    destination,
-                    GIT_TIMEOUT,
-                )
-                .is_err(),
+                clone(temp.0.to_str().unwrap(), destination).is_err(),
                 "{}",
                 destination.display()
             );
         }
         assert!(!Path::new("relative-clone").exists() && !missing.exists());
+    }
+
+    #[test]
+    fn refuses_a_transport_the_user_config_allows_but_the_app_does_not() {
+        let temp = TempDir::new("gm71");
+        let marker = temp.0.join("ran");
+        let destination = temp.0.join("clone");
+        fs::create_dir(&destination).unwrap();
+        let mut command = git_without_credential_helpers();
+        command.args(["-c", "protocol.ext.allow=always"]);
+        // Past the validator, as a future caller or a validator gap would be.
+        let source = format!(
+            "ext::sh -c touch% {}",
+            marker.to_str().unwrap().replace('\\', "/")
+        );
+
+        let error = run_clone(
+            command,
+            &source,
+            &destination,
+            GIT_CLONE_STALL_TIMEOUT,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("transport 'ext' not allowed"), "{error}");
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -3771,11 +3917,9 @@ mod clone_tests {
         ));
         let destination = temp.0.join("clone");
 
-        let error = clone_repository_to(
-            git_without_credential_helpers(),
+        let error = clone(
             &format!("http://leaky-token@127.0.0.1:{port}/repo.git"),
             &destination,
-            GIT_TIMEOUT,
         )
         .unwrap_err();
 
@@ -3797,13 +3941,7 @@ mod clone_tests {
             .port();
         let destination = temp.0.join("clone");
 
-        let error = clone_repository_to(
-            git_without_credential_helpers(),
-            &format!("http://127.0.0.1:{port}/repo.git"),
-            &destination,
-            GIT_TIMEOUT,
-        )
-        .unwrap_err();
+        let error = clone(&format!("http://127.0.0.1:{port}/repo.git"), &destination).unwrap_err();
 
         assert!(!error.starts_with("Authentication failed"), "{error}");
         assert!(error.contains("unable to access"), "{error}");
@@ -3811,7 +3949,7 @@ mod clone_tests {
     }
 
     #[test]
-    fn stops_a_stalled_clone_and_removes_its_partial_folder() {
+    fn abandons_a_stalled_http_transfer_and_removes_its_partial_folder() {
         let temp = TempDir::new("gm70");
         let port = local_server(None);
         let destination = temp.0.join("clone");
@@ -3822,12 +3960,74 @@ mod clone_tests {
             &format!("http://127.0.0.1:{port}/repo.git"),
             &destination,
             Duration::from_secs(2),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
 
-        assert!(error.contains("did not finish"), "{error}");
+        assert!(error.contains("Operation too slow"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(20));
         assert!(!destination.exists(), "{error}");
+    }
+
+    #[test]
+    fn cancels_a_clone_and_removes_its_partial_folder() {
+        let temp = TempDir::new("gm71");
+        let port = local_server(None);
+        let destination = temp.0.join("clone");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let canceller = Arc::clone(&cancel);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            canceller.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+
+        let error = clone_repository_to(
+            git_without_credential_helpers(),
+            &format!("http://127.0.0.1:{port}/repo.git"),
+            &destination,
+            GIT_CLONE_STALL_TIMEOUT,
+            &cancel,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Clone cancelled");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn keeps_a_downloaded_clone_whose_checkout_failed() {
+        let temp = TempDir::new("gm71");
+        let source = bare_source(&temp);
+        let hooks = temp.0.join("hooks");
+        fs::create_dir(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut command = git_without_credential_helpers();
+        command.arg("-c").arg(format!(
+            "core.hooksPath={}",
+            hooks.to_str().unwrap().replace('\\', "/")
+        ));
+        let destination = temp.0.join("clone");
+
+        let error = clone_repository_to(
+            command,
+            source.to_str().unwrap(),
+            &destination,
+            GIT_CLONE_STALL_TIMEOUT,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not check out its files"), "{error}");
+        assert!(error.contains(destination.to_str().unwrap()), "{error}");
+        assert_eq!(head(&destination), head(&source));
     }
 
     #[test]
@@ -3837,13 +4037,7 @@ mod clone_tests {
         fs::create_dir(&source).unwrap();
         let destination = temp.0.join("clone");
 
-        let error = clone_repository_to(
-            git_without_credential_helpers(),
-            source.to_str().unwrap(),
-            &destination,
-            GIT_TIMEOUT,
-        )
-        .unwrap_err();
+        let error = clone(source.to_str().unwrap(), &destination).unwrap_err();
 
         assert!(
             error.contains("does not appear to be a git repository"),

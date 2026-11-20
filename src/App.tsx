@@ -234,12 +234,10 @@ function App() {
     function handleKey(event: globalThis.KeyboardEvent) {
       const dialog = document.querySelector("dialog[open]");
       if (event.key === "Escape" && dialog) {
-        // Prevented here, Escape never closes the dialog natively: React state alone decides, and a commit or clone
-        // started from a dialog cannot be stopped safely, so the dialog stays until it ends.
+        // Prevented here, Escape never closes the dialog natively: React state alone decides. It presses the dialog's
+        // Cancel button, which a dialog disables while it cannot be left safely (a commit in progress).
         event.preventDefault();
-        if (dialog.id === "clone-dialog") {
-          if (!cloningRef.current) closeClonePrompt();
-        } else if (!committingRef.current) closeIdentityPrompt();
+        dialog.querySelector<HTMLButtonElement>("button[data-cancel]:not(:disabled)")?.click();
       } else if (event.key === "Escape" && selectedDiffRef.current) {
         event.preventDefault();
         backToHistory();
@@ -310,7 +308,10 @@ function App() {
     cloningRef.current = true;
     setCloning(true);
     setCloneError(null);
-    focusTargetRef.current = () => document.getElementById("clone-source"); // the inputs are disabled while cloning
+    // The inputs are disabled while cloning: the focus waits on Cancel, the one control left, and the source field
+    // takes it back if it was lost.
+    document.getElementById("clone-cancel")?.focus();
+    focusTargetRef.current = () => document.getElementById("clone-source");
     try {
       await invoke("clone_repository", { source, destination });
     } catch (error) {
@@ -1017,7 +1018,7 @@ function App() {
             </label>
             {identityError && <p className="error-message" role="alert">{identityError}</p>}
             <footer>
-              <button className="button button-secondary" type="button" disabled={committing} onClick={closeIdentityPrompt}>Cancel</button>
+              <button className="button button-secondary" type="button" data-cancel disabled={committing} onClick={closeIdentityPrompt}>Cancel</button>
               <button className="button button-primary" type="submit" disabled={committing}>Continue</button>
             </footer>
           </form>
@@ -1079,7 +1080,16 @@ function App() {
             <footer>
               {/* Inside the dialog, since the titlebar status is inert behind it; always rendered so the change is announced. */}
               <p className="clone-progress" role="status">{cloning ? "Cloning, this can take a while…" : ""}</p>
-              <button className="button button-secondary" type="button" disabled={cloning} onClick={closeClonePrompt}>Cancel</button>
+              {/* While cloning it stops Git, which removes the partial clone. */}
+              <button
+                id="clone-cancel"
+                className="button button-secondary"
+                type="button"
+                data-cancel
+                onClick={() => (cloningRef.current ? void invoke("cancel_clone") : closeClonePrompt())}
+              >
+                Cancel
+              </button>
               <button className="button button-primary" type="submit" disabled={cloning}>{cloning ? "Cloning…" : "Clone"}</button>
             </footer>
           </form>
