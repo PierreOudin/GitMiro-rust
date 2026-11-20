@@ -1538,25 +1538,20 @@ fn run_clone(
     if output.status.success() {
         return Ok(());
     }
-    // Git Credential Manager appends a .NET stack trace to its errors: noise for the user.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = redact_url_credentials(
-        stderr
+    let detail = redact_url_credentials(String::from_utf8_lossy(&output.stderr).trim());
+    // GCM_INTERACTIVE=never or credential.interactive=false, often inherited from the terminal GitMiro was started
+    // from: the user's setting is respected, but named. GCM's .NET stack trace (frames, inner exceptions) is dropped.
+    if detail.contains("user interactivity has been disabled") {
+        let message: Vec<_> = detail
             .lines()
             .filter(|line| {
-                let stack_frame =
-                    line.starts_with(char::is_whitespace) && line.trim_start().starts_with("at ");
-                !stack_frame && !line.starts_with("--- End of stack trace")
+                let line = line.trim_start();
+                !line.starts_with("at ") && !line.starts_with("---")
             })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim(),
-    );
-    // GCM_INTERACTIVE=never or credential.interactive=false, often inherited from the terminal GitMiro was started
-    // from; the user's setting is respected, but named.
-    if detail.contains("user interactivity has been disabled") {
+            .collect();
         return Err(format!(
-            "Authentication failed: Git Credential Manager prompts are turned off (GCM_INTERACTIVE or credential.interactive); allow them, or sign in once from a terminal, then try again\n{detail}"
+            "Authentication failed: Git Credential Manager prompts are turned off by GCM_INTERACTIVE or credential.interactive; set it to auto (restart GitMiro if the variable came from the terminal that started it), then try again\n{}",
+            message.join("\n")
         ));
     }
     if CLONE_AUTH_ERRORS.iter().any(|error| detail.contains(error)) {
@@ -3955,7 +3950,9 @@ mod clone_tests {
             "-c",
             "credential.helper=!f() { echo 'fatal: Cannot prompt because user interactivity has been disabled.' >&2; \
              printf '   at GitCredentialManager.Authentication.ThrowIfUserInteractionDisabled()\\r\\n\
-             --- End of stack trace from previous location ---\\r\\n' >&2; exit 1; }; f",
+             --- End of stack trace from previous location ---\\r\\n \
+             ---> System.InvalidOperationException: inner\\r\\n   --- End of inner exception stack trace ---\\r\\n' >&2; \
+             exit 1; }; f",
         ]);
 
         let error = clone_repository_to(
@@ -3978,7 +3975,8 @@ mod clone_tests {
             "{error}"
         );
         assert!(!error.contains(" at GitCredentialManager"), "{error}");
-        assert!(!error.contains("End of stack trace"), "{error}");
+        assert!(!error.contains("End of"), "{error}");
+        assert!(!error.contains("InvalidOperationException"), "{error}");
         assert!(!destination.exists());
     }
 
