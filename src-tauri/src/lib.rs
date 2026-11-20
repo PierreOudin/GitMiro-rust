@@ -1538,7 +1538,27 @@ fn run_clone(
     if output.status.success() {
         return Ok(());
     }
-    let detail = redact_url_credentials(String::from_utf8_lossy(&output.stderr).trim());
+    // Git Credential Manager appends a .NET stack trace to its errors: noise for the user.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = redact_url_credentials(
+        stderr
+            .lines()
+            .filter(|line| {
+                let stack_frame =
+                    line.starts_with(char::is_whitespace) && line.trim_start().starts_with("at ");
+                !stack_frame && !line.starts_with("--- End of stack trace")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim(),
+    );
+    // GCM_INTERACTIVE=never or credential.interactive=false, often inherited from the terminal GitMiro was started
+    // from; the user's setting is respected, but named.
+    if detail.contains("user interactivity has been disabled") {
+        return Err(format!(
+            "Authentication failed: Git Credential Manager prompts are turned off (GCM_INTERACTIVE or credential.interactive); allow them, or sign in once from a terminal, then try again\n{detail}"
+        ));
+    }
     if CLONE_AUTH_ERRORS.iter().any(|error| detail.contains(error)) {
         return Err(format!(
             "Authentication failed: set up access with your Git credential manager or SSH key, then try again\n{detail}"
@@ -3918,6 +3938,47 @@ mod clone_tests {
         assert!(!error.contains("leaky-token"), "{error}");
         // Git's own message names the URL with its user name: it reached the page redacted.
         assert!(error.contains("http://***@127.0.0.1"), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn names_turned_off_credential_manager_prompts_without_its_stack_trace() {
+        let temp = TempDir::new("gm72");
+        let port = local_server(Some(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitMiro\"\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        ));
+        let destination = temp.0.join("clone");
+        // Stands in for Git Credential Manager with GCM_INTERACTIVE=never: its error and .NET stack trace.
+        let mut command = git_without_credential_helpers();
+        command.args([
+            "-c",
+            "credential.helper=!f() { echo 'fatal: Cannot prompt because user interactivity has been disabled.' >&2; \
+             printf '   at GitCredentialManager.Authentication.ThrowIfUserInteractionDisabled()\\r\\n\
+             --- End of stack trace from previous location ---\\r\\n' >&2; exit 1; }; f",
+        ]);
+
+        let error = clone_repository_to(
+            command,
+            &format!("http://127.0.0.1:{port}/repo.git"),
+            &destination,
+            GIT_CLONE_STALL_TIMEOUT,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.starts_with(
+                "Authentication failed: Git Credential Manager prompts are turned off"
+            ),
+            "{error}"
+        );
+        assert!(
+            error.contains("user interactivity has been disabled"),
+            "{error}"
+        );
+        assert!(!error.contains(" at GitCredentialManager"), "{error}");
+        assert!(!error.contains("End of stack trace"), "{error}");
         assert!(!destination.exists());
     }
 

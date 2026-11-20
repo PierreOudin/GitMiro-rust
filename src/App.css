@@ -201,6 +201,7 @@
 
 .error-message {
   color: var(--error);
+  white-space: pre-line; /* Git's messages are several lines */
 }
 
 .repository-view {

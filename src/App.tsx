@@ -222,7 +222,8 @@ function App() {
     const target = focusTargetRef.current;
     if (!target || opening || committing || changingStatus || cloning) return;
     focusTargetRef.current = null;
-    if (document.activeElement && document.activeElement !== document.body) return;
+    // The clone progress message only holds the focus while cloning; it is empty afterwards.
+    if (document.activeElement && document.activeElement !== document.body && document.activeElement.id !== "clone-progress") return;
     [target(), document.getElementById("commit-message")]
       .find((element) => element?.isConnected && !element.matches(":disabled"))
       ?.focus();
@@ -309,9 +310,9 @@ function App() {
     setCloning(true);
     setCloneError(null);
     // The inputs are disabled while cloning: the focus waits on the progress message (a held Enter must not reach
-    // Cancel), Tab leads to Cancel, and the source field takes the focus back if it was lost.
+    // Cancel), and Tab leads to Cancel. On failure it moves to the error, which a held Enter cannot resubmit.
     document.getElementById("clone-progress")?.focus();
-    focusTargetRef.current = () => document.getElementById("clone-source");
+    focusTargetRef.current = () => document.getElementById("clone-error") ?? document.getElementById("clone-source");
     try {
       await invoke("clone_repository", { source, destination });
     } catch (error) {
@@ -1076,7 +1077,7 @@ function App() {
                 setClonePrompt({ ...clonePrompt, folder: event.target.value });
               }}
             />
-            {cloneError && <p className="error-message" role="alert">{cloneError}</p>}
+            {cloneError && <p id="clone-error" className="error-message" role="alert" tabIndex={-1}>{cloneError}</p>}
             <footer>
               {/* Inside the dialog, since the titlebar status is inert behind it; always rendered so the change is announced. */}
               <p id="clone-progress" className="clone-progress" role="status" tabIndex={-1}>
