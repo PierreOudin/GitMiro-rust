@@ -53,9 +53,6 @@ fn git_command() -> Command {
     command.stdin(Stdio::null()); // callers that feed Git override this with a pipe
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000); // CREATE_NO_WINDOW
-    // Its own process group, so kill_process_tree can stop the processes Git starts along with it.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command
 }
 
@@ -307,7 +304,8 @@ fn collect_output_capped_and_killing_on_truncation(child: Child) -> Result<(Outp
 /// Stops Git and the processes it started (a hook, a filter, a signing program, a clone's transport and index-pack):
 /// `Child::kill` alone leaves them running. The kill is forced, so Git cannot clean up after itself: a timed-out write
 /// command can leave `.git/index.lock` behind, and the next write then fails until that file is removed. Outside
-/// Windows the whole process group `git_command` created is killed; a process that left that group survives.
+/// Windows a clone runs in its own process group (`run_clone`), killed whole; for other commands no such group
+/// exists, so only Git is killed (a group of their own would stop a terminal prompt with SIGTTIN under `tauri dev`).
 fn kill_process_tree(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -377,9 +375,6 @@ enum Stop<'a> {
     WhenSet(&'a AtomicBool),
 }
 
-/// The error `collect_output_until` returns for a Git stopped through `Stop::WhenSet`.
-const CANCELLED: &str = "Cancelled";
-
 fn collect_output_until(
     child: &mut Child,
     input: Option<&[u8]>,
@@ -428,7 +423,9 @@ fn collect_output_until(
                 "Git did not finish within {} seconds and was stopped",
                 timeout.as_secs()
             )),
-            Stop::WhenSet(flag) if flag.load(Ordering::Relaxed) => Some(CANCELLED.to_owned()),
+            Stop::WhenSet(flag) if flag.load(Ordering::Relaxed) => {
+                Some("Clone cancelled".to_owned())
+            }
             _ => None,
         };
         match child.try_wait() {
@@ -1322,8 +1319,9 @@ fn repository_root(path: &Path) -> Result<String, String> {
 /// inside Git (`GIT_ALLOW_PROTOCOL`), which also covers redirects and remote helpers (`ext::` runs commands).
 const CLONE_PROTOCOLS: [&str; 4] = ["https", "http", "ssh", "file"];
 
-/// Whether ssh would read `part` (a URL user or host, which Git percent-decodes) as an option.
+/// Whether ssh would read `part` (a URL user or host, which Git percent-decodes and strips of `[]`) as an option.
 fn looks_like_option(part: &str) -> bool {
+    let part = part.strip_prefix('[').unwrap_or(part);
     part.starts_with('-')
         || part
             .get(..3)
@@ -1454,28 +1452,18 @@ fn clone_repository_to(
     let Err(error) = run_clone(command, source, destination, stall_timeout, cancel) else {
         return Ok(());
     };
-    if error == CANCELLED {
-        let _ = fs::remove_dir_all(destination);
-        return Err(if destination.exists() {
-            format!(
-                "Clone cancelled; remove the partial clone in {}",
-                destination.display()
-            )
-        } else {
-            "Clone cancelled".to_owned()
-        });
-    }
     // Git keeps a clone whose history arrived but whose checkout failed (a path Windows refuses, a failing
-    // post-checkout hook), and removes the others; this is the only case where its HEAD still names a commit.
-    if has_head_commit(destination) {
+    // post-checkout hook), and removes the others; this is the only failure after which its HEAD still names a
+    // commit. A cancelled clone is removed even then.
+    if !cancel.load(Ordering::Relaxed) && has_head_commit(destination) {
         return Err(format!(
             "The repository was downloaded into {}, but Git could not check out its files; the folder was kept\n{error}",
             destination.display()
         ));
     }
-    // Git empties the folder on the other failures but keeps it since it already existed; the folder is this call's
-    // own.
-    if fs::remove_dir_all(destination).is_err() && destination.exists() {
+    // Git empties the folder on the other failures but keeps it since it already existed, and a stopped Git cleans
+    // nothing; the folder is this call's own.
+    if !remove_partial_clone(destination) {
         return Err(format!(
             "{error}; remove the partial clone in {}",
             destination.display()
@@ -1484,17 +1472,33 @@ fn clone_repository_to(
     Err(error)
 }
 
+/// Removes `destination`, retrying for a second: on Windows the processes `kill_process_tree` stopped (index-pack
+/// writing the pack) may still hold their files open for a moment.
+fn remove_partial_clone(destination: &Path) -> bool {
+    for _ in 0..10 {
+        if fs::remove_dir_all(destination).is_ok() || !destination.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 /// Whether `destination/.git` is a repository whose HEAD is a commit. The Git directory is named, never searched
 /// for: a destination inside another repository must not find that one.
 fn has_head_commit(destination: &Path) -> bool {
-    git_command()
+    let mut command = git_command();
+    command
         .arg("--git-dir")
         .arg(destination.join(".git"))
         .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+        .spawn()
+        .ok()
+        .and_then(|child| collect_output(child).ok())
+        .is_some_and(|output| output.status.success())
 }
 
 fn run_clone(
@@ -1518,6 +1522,9 @@ fn run_clone(
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Its own process group, so kill_process_tree also stops its transport and index-pack.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().map_err(spawn_error)?;
     // Clone output is not used: too much of it (a chatty global hook) must not fail a finished clone.
     let (output, _) = collect_output_until(
@@ -2015,8 +2022,9 @@ struct AppStateInner {
     open_root: Mutex<Option<String>>,
     /// Serializes index and COMMIT_EDITMSG writers (stage, unstage, resolve, commit, draft saves).
     mutation: Mutex<()>,
-    /// The cancel flag of the clone in progress, if any.
-    clone_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// Set by `cancel_clone`, cleared when a clone starts.
+    // ponytail: one flag, so a cancel stops every clone in progress; the page runs one clone at a time.
+    clone_cancelled: AtomicBool,
 }
 
 impl AppState {
@@ -2046,13 +2054,6 @@ impl AppState {
         } else {
             Err("This repository is not the open repository; open it again".to_owned())
         }
-    }
-
-    fn clone_cancel(&self) -> MutexGuard<'_, Option<Arc<AtomicBool>>> {
-        self.0
-            .clone_cancel
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock_mutations(&self) -> MutexGuard<'_, ()> {
@@ -2088,26 +2089,16 @@ async fn clone_repository(
     destination: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
-    let cancel = Arc::new(AtomicBool::new(false));
-    // ponytail: one slot, so `cancel_clone` stops the latest clone; the page runs one clone at a time.
-    *state.clone_cancel() = Some(Arc::clone(&cancel));
+    // A cancel that arrived after the previous clone ended must not stop this one.
+    state.0.clone_cancelled.store(false, Ordering::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
-        let result = clone_repository_to(
+        clone_repository_to(
             git_command(),
             &source,
             Path::new(&destination),
             GIT_CLONE_STALL_TIMEOUT,
-            &cancel,
-        );
-        // A cancel that arrives after the clone ended must not reach the next one.
-        let mut slot = state.clone_cancel();
-        if slot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &cancel))
-        {
-            *slot = None;
-        }
-        result
+            &state.0.clone_cancelled,
+        )
     })
     .await
     .map_err(|error| format!("Could not clone repository: {error}"))?
@@ -2116,9 +2107,7 @@ async fn clone_repository(
 /// Stops the clone in progress; its partial folder is removed. Does nothing when no clone runs.
 #[tauri::command]
 fn cancel_clone(state: tauri::State<'_, AppState>) {
-    if let Some(cancel) = state.clone_cancel().as_ref() {
-        cancel.store(true, Ordering::Relaxed);
-    }
+    state.0.clone_cancelled.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -3842,6 +3831,8 @@ mod clone_tests {
             "ssh://-oProxyCommand=calc@example.invalid/repo.git",
             "ssh://%2DoProxyCommand=calc@example.invalid/repo.git",
             "ssh://git@%2doProxyCommand=calc/repo.git",
+            "ssh://[-oProxyCommand=calc]/repo.git",
+            "[-oProxyCommand=calc]:repo.git",
             "git@-oProxyCommand=calc:repo.git",
             missing.to_str().unwrap(),
         ] {
