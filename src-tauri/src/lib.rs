@@ -1542,16 +1542,16 @@ fn run_clone(
     // GCM_INTERACTIVE=never or credential.interactive=false, often inherited from the terminal GitMiro was started
     // from: the user's setting is respected, but named. GCM's .NET stack trace (frames, inner exceptions) is dropped.
     if detail.contains("user interactivity has been disabled") {
-        let message: Vec<_> = detail
-            .lines()
-            .filter(|line| {
-                let line = line.trim_start();
-                !line.starts_with("at ") && !line.starts_with("---")
-            })
-            .collect();
         return Err(format!(
             "Authentication failed: Git Credential Manager prompts are turned off by GCM_INTERACTIVE or credential.interactive; set it to auto (restart GitMiro if the variable came from the terminal that started it), then try again\n{}",
-            message.join("\n")
+            detail
+                .lines()
+                .filter(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with("at ") && !line.starts_with("---")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
     if CLONE_AUTH_ERRORS.iter().any(|error| detail.contains(error)) {
